@@ -1,0 +1,23 @@
+--extra-index-url https://download.pytorch.org/whl/cu131
+torch==2.5.1
+torchvision
+torchaudio
+
+transformers==4.47.1
+datasets
+accelerate==1.3.0
+peft==0.14.0
+trl>=0.8.0
+
+bitsandbytes
+scipy
+sentencepiece
+protobuf
+tqdm
+
+wandb==0.19.1
+tensorboard
+
+ipykernel
+ipywidgets
+matplotlib==3.10.8
