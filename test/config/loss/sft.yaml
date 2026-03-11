@@ -1,0 +1,10 @@
+# config/loss/sft.yaml
+# Supervised Fine-Tuning (SFT) stage
+
+name: sft
+
+# Path where the SFT model will be saved after training.
+# This path is also used by the DPO stage to load the SFT model as the
+# reference model.  Defaults to the experiment output dir; override if needed.
+# Leave as null to use the default: outputs/<exp_name>/final_model
+output_path: null

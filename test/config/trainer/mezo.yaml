@@ -1,0 +1,10 @@
+# config/trainer/mezo.yaml
+# MeZO (Memory-Efficient Zeroth-Order) trainer settings
+
+name: mezo          # must match the key used in train.py's TRAINER_MAP
+
+# SGD-style zeroth-order learning rate
+lr: 1e-6
+
+# finite-difference epsilon (perturbation step size)
+eps: 1e-3

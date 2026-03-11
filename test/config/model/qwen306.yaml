@@ -1,0 +1,3 @@
+# config/model/qwen306.yaml
+name_or_path: Qwen/Qwen3-0.6B
+policy_dtype: bfloat16

@@ -1,0 +1,38 @@
+# ── Hydra: redirect outputs to /tmp so the project dir stays clean ──
+hydra:
+  run:
+    dir: /tmp/hydra_tmp/${exp_name}
+  output_subdir: null
+
+# ── Reproducibility ─────────────────────────────────────────
+seed: 42
+
+# ── Experiment identity ──────────────────────────────────────
+exp_name: ???           # MUST be set on the command line
+
+# ── Data ─────────────────────────────────────────────────────
+batch_size: 16
+max_length: 512          # max total sequence length (prompt + response)
+max_prompt_length: 256   # max prompt length before truncation
+total_batches: 100       # how many batches to cache and train on
+
+# ── W&B ──────────────────────────────────────────────────────
+wandb:
+  enabled: true
+  entity: "weiyunh225-uppsala-universitet"
+  project: "zo-dpo-server"
+
+# ── Storage directories ───────────────────────────────────────
+hf_cache_dir: "/media/tsar_bomba/$USER/huggingface_cache"
+hf_dataset_cache_dir: "/media/tsar_bomba/$USER/datasets"
+checkpoint_dir: "/media/tsar_bomba/$USER/checkpoints"
+
+runs_dir: "/media/tsar_bomba/$USER/runs"
+checkpoint_every: 50
+
+# ── Hydra config-group defaults ──────────────────────────────
+defaults:
+  - _self_
+  - model: qwen306        # config/model/qwen306.yaml
+  - trainer: mezo          # config/trainer/mezo.yaml  or  agzo.yaml
+  - loss: sft              # config/loss/sft.yaml      or  dpo.yaml
