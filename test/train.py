@@ -37,7 +37,12 @@ def main(config: DictConfig):
     print(OmegaConf.to_yaml(config))
     print("=" * 72)
     print(f"Host      : {socket.gethostname()}")
-    print(f"Trainer   : {config.trainer.name}")
+    if config.loss.name == "sft":
+        display_trainer = "TRL SFTTrainer"
+    else:
+        display_trainer = config.trainer.name
+
+    print(f"Trainer   : {display_trainer}")
     print(f"Loss/Stage: {config.loss.name}")
     print(f"Output dir: {config.runs_dir}")
     print("=" * 72)

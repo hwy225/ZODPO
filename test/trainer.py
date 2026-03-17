@@ -11,6 +11,7 @@ import tqdm
 import wandb
 from accelerate import Accelerator
 from omegaconf import DictConfig
+from trl import SFTConfig, SFTTrainer
 
 from preference_datasets_hh import get_chat_template_iterator
 
@@ -231,6 +232,13 @@ class ZOTrainerBase:
     def train(self):
         stage = self.config.loss.name   # "sft" | "dpo"
 
+        if stage == "sft":
+            # Standard gradient-based SFT via TRL SFTTrainer.
+            # No ZO loop, no batch caching.
+            self._run_sft_standard()
+            return
+
+        # DPO (and any future ZO stages): cache batches to CPU RAM first.
         print(f"Caching {self.total_batches} batches ...")
         cached_batches: List[dict] = []
         it = get_chat_template_iterator(
@@ -246,9 +254,7 @@ class ZOTrainerBase:
         for _ in tqdm.tqdm(range(self.total_batches), desc="Loading"):
             cached_batches.append(next(it))
 
-        if stage == "sft":
-            self._run_sft(cached_batches)
-        elif stage == "dpo":
+        if stage == "dpo":
             self._run_dpo(cached_batches, beta=self.config.loss.beta)
         else:
             raise ValueError(
@@ -259,15 +265,130 @@ class ZOTrainerBase:
     # Stage runners
     # ================================================================
 
-    def _run_sft(self, cached_batches: List[dict]):
-        print("\n--- SFT ---")
+    def _run_sft_standard(self):
+        """
+        Standard supervised fine-tuning via trl.SFTTrainer.
 
-        # Resume from the latest checkpoint if one exists.
-        # _try_resume also populates self.resumed_wandb_run_id so that
-        # train.py can connect to the existing W&B run before logging starts.
+        Uses full gradient-based training (not ZO).  The model saved here
+        becomes the starting point and frozen reference for the DPO stage.
+
+        Dataset format expected by TRL SFTTrainer (conversational):
+            {"messages": [{"role": "user",      "content": "..."},
+                          {"role": "assistant", "content": "..."}]}
+        or prompt-completion:
+            {"prompt": "...", "completion": "..."}
+
+        The hh-rlhf dataset is loaded directly from HuggingFace (not via
+        preference_datasets_hh) so TRL can handle tokenisation and masking.
+        """
+        print("\n--- SFT (TRL SFTTrainer) ---")
+
+        sft_cfg = self.config.loss      # config/loss/sft.yaml
+        stage   = "sft"
+
+        # ── build HF dataset for TRL ─────────────────────────────────
+        # Load hh-rlhf and convert to the prompt-completion format that
+        # TRL understands natively.  Only the "chosen" column is used.
+        from datasets import load_dataset
+        import re
+        raw = load_dataset(
+            "Anthropic/hh-rlhf",
+            cache_dir=self.dataset_cache_dir,
+            split="train",
+        )
+
+        tokenizer = self.tokenizer
+        def _to_prompt_completion(example):
+            text: str = example["chosen"]
+            
+            parts = re.split(r'\n\n(Human|Assistant):', text)
+            msgs = []
+            for j in range(1, len(parts), 2):
+                role = "user" if parts[j].strip() == "Human" else "assistant"
+                content = parts[j+1].strip()
+                msgs.append({"role": role, "content": content})
+            
+            # Locate the final assistant turn
+            last_assistant_idx = -1
+            for idx in range(len(msgs) - 1, -1, -1):
+                if msgs[idx]["role"] == "assistant":
+                    last_assistant_idx = idx
+                    break
+            
+            if last_assistant_idx == -1:
+                return {"prompt": text, "completion": ""}
+                
+            prompt_msgs = msgs[:last_assistant_idx]
+            chosen_msg = msgs[last_assistant_idx]
+            
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_msgs, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            return {
+                "prompt": prompt_text,
+                "completion": chosen_msg["content"]
+            }
+
+        dataset = raw.map(
+            _to_prompt_completion,
+            remove_columns=raw.column_names,
+            desc="Formatting dataset",
+        )
+
+        # ── SFTConfig ────────────────────────────────────────────────
+        out_dir = os.path.join(self.runs_dir, "final_model")
+        sft_config = SFTConfig(
+            output_dir=out_dir,
+            num_train_epochs=int(sft_cfg.get("num_train_epochs", 1)),
+
+            # max_steps=self.total_batches, # only for test
+
+            per_device_train_batch_size=self.config.batch_size,
+            learning_rate=float(sft_cfg.get("lr", 5e-5)),
+            lr_scheduler_type=sft_cfg.get("lr_scheduler_type", "cosine"),
+            warmup_ratio=float(sft_cfg.get("warmup_ratio", 0.03)),
+            max_length=self.config.max_length,
+            gradient_checkpointing=True,
+            completion_only_loss=True,   # mask prompt tokens, train on completion only
+            logging_steps=10,
+            save_strategy="steps",
+            save_steps=500,
+            save_total_limit=2,
+            bf16=(self.config.model.policy_dtype == "bfloat16"),
+            fp16=(self.config.model.policy_dtype == "float16"),
+            report_to="wandb" if self.config.wandb.enabled else "none",
+        )
+
+        # ── run TRL SFTTrainer ───────────────────────────────────────
+        trainer = SFTTrainer(
+            model=self.policy,
+            args=sft_config,
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+        )
+        trainer.train()
+
+        # ── save final model (main process only) ─────────────────────
+        self.save_final(stage)
+
+    def _run_sft(self, cached_batches: List[dict]):
+        """
+        ZO-SFT loop (kept for potential future use / ablations).
+
+        NOTE: this is NOT called when loss=sft.  The standard entry point
+        is _run_sft_standard() above.  This method exists so a subclass
+        can run a ZO warm-up before DPO without using TRL, e.g.:
+            self._run_sft(cached_batches)   # ZO warm-up
+            self._run_dpo(...)
+        """
+        print("\n--- ZO-SFT (zeroth-order) ---")
+
         resume_step, loss_history = self._try_resume("sft")
         if resume_step > 0:
-            print(f"  Resuming SFT from step {resume_step + 1} / {len(cached_batches)}")
+            print(f"  Resuming ZO-SFT from step {resume_step + 1} / {len(cached_batches)}")
 
         self.policy.train()
         total = len(cached_batches)
@@ -284,8 +405,8 @@ class ZOTrainerBase:
             loss_history.append(loss)
 
             if self.accelerator.is_main_process:
-                print(f"SFT {step}/{total} | loss={loss:.4f}")
-                wandb.log({"train/sft_loss": loss, "step": step})
+                print(f"ZO-SFT {step}/{total} | loss={loss:.4f}")
+                wandb.log({"train/zo_sft_loss": loss, "step": step})
 
             if step % self.checkpoint_every == 0:
                 self._save_checkpoint("sft", step, loss_history)
@@ -567,14 +688,16 @@ class MeZOTrainer(ZOTrainerBase):
 
 class AGZOEngine:
     """
-    Manages forward hooks and activation-difference subspace computation.
+    Manages forward hooks and activation subspace computation.
 
     Public API
     ----------
-    collect_sft(fwd_fn)         run fwd_fn(), capture chosen activations
+    collect_sft(fwd_fn)         run fwd_fn() (chosen only), plain activation basis
+    collect_plain(fwd_fn)       run fwd_fn() (any batch), plain activation basis
+                                 same math as collect_sft; for plain-AGZO DPO steps
     collect_dpo(fwd_fn, B)      run fwd_fn() on [chosen;rejected] concat,
-                                 compute H_diff subspace per layer
-    sample_z(name, param)       sample structured perturbation z
+                                 H_diff = H_c - H_r subspace (preference-aware)
+    sample_z(name, param)       sample structured perturbation z from current basis
     remove_hooks()              deregister all forward hooks
     """
 
@@ -586,7 +709,11 @@ class AGZOEngine:
         self.basis: Dict[str, torch.Tensor] = {}   # param_name -> (r, d_in)
         self._hooks:     List  = []
         self._param_map: Dict[str, nn.Parameter] = {}
-        self._mode: Optional[str] = None   # "sft" | "dpo" | None
+        # Modes:
+        #   "sft"   -- plain activations from a single (chosen-only) forward
+        #   "plain" -- plain activations from any forward (merged or single)
+        #   "dpo"   -- H_diff = H_chosen - H_rejected  (preference subspace)
+        self._mode: Optional[str] = None
         self._B:    int            = 0     # single-side batch size (dpo mode)
 
         self._register_hooks()
@@ -614,7 +741,10 @@ class AGZOEngine:
                 return
             act = act.detach()   # (B_total, T, d)
 
-            if self._mode == "sft":
+            if self._mode in ("sft", "plain"):
+                # Plain activation subspace: use all rows of the activation
+                # matrix as-is, regardless of whether this is a single-sequence
+                # or a concatenated [chosen; rejected] batch.
                 basis = self._make_basis(act.reshape(-1, act.shape[-1]).float(), pname)
 
             elif self._mode == "dpo":
@@ -674,6 +804,22 @@ class AGZOEngine:
     def collect_sft(self, fwd_fn):
         self.basis.clear()
         self._mode = "sft"
+        try:
+            with torch.no_grad():
+                fwd_fn()
+        finally:
+            self._mode = None
+
+    def collect_plain(self, fwd_fn):
+        """
+        Run fwd_fn() and build the activation subspace directly from the
+        raw activation matrix -- no chosen/rejected splitting, no H_diff.
+
+        The subspace captures directions of high activation variance in the batch, 
+        irrespective of label identity.
+        """
+        self.basis.clear()
+        self._mode = "plain"
         try:
             with torch.no_grad():
                 fwd_fn()
@@ -823,12 +969,75 @@ class AGZOTrainer(ZOTrainerBase):
 
 
 # ============================================================
+# AGZOPlain  --  plain-activation subspace perturbation
+# ============================================================
+
+class AGZOPlainTrainer(AGZOTrainer):
+    """
+    Plain-AGZO: activation-guided perturbation WITHOUT the H_diff trick.
+
+    Both SFT and DPO steps build the per-layer basis from the raw activation
+    matrix of the forward pass (i.e. collect_plain instead of collect_dpo).
+    This captures directions of high activation variance in the batch but does
+    NOT explicitly align the subspace with the chosen-vs-rejected preference
+    direction.
+
+    Use this as an ablation baseline against AGZOTrainer (agzo):
+      trainer=agzo_plain  -->  activation guidance, no H_diff
+      trainer=agzo        -->  activation guidance + H_diff preference subspace
+
+    Forward count per DPO step (identical to AGZOTrainer):
+      3  =  1 plain basis (merged) + 2 x 1 (merged +/-eps)
+    """
+
+    # _sft_step is inherited unchanged from AGZOTrainer (already uses collect_sft
+    # which is plain-activation, so no override needed).
+
+    def _dpo_step(self, gpu_batch: dict, beta: float) -> float:
+        self._reset_seed()
+        B    = gpu_batch['chosen_input_ids'].shape[0]
+        ids, mask = self._concat_cr(gpu_batch)
+
+        # KEY DIFFERENCE: collect_plain instead of collect_dpo
+        # The subspace is built from the raw concatenated activations
+        # without splitting or differencing chosen vs rejected.
+        self._engine.collect_plain(
+            lambda: self.policy(ids, attention_mask=mask)
+        )
+
+        def _fwd_split() -> Tuple[torch.Tensor, torch.Tensor]:
+            logits = self.policy(ids, attention_mask=mask).logits
+            return logits[:B], logits[B:]
+
+        with torch.no_grad():
+            self._perturb(+1)
+            c_p, r_p = _fwd_split()
+            loss_p = compute_dpo_loss(
+                c_p, r_p,
+                gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
+                gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
+                beta,
+            )
+            self._perturb(-2)
+            c_m, r_m = _fwd_split()
+            loss_m = compute_dpo_loss(
+                c_m, r_m,
+                gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
+                gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
+                beta,
+            )
+            self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
+        return ((loss_p + loss_m) / 2).item()
+
+
+# ============================================================
 # Registry
 # ============================================================
 
 TRAINER_MAP: Dict[str, type] = {
-    "mezo": MeZOTrainer,
-    "agzo": AGZOTrainer,
+    "mezo":       MeZOTrainer,
+    "agzo":       AGZOTrainer,        # activation-guided, H_diff preference subspace (DPO)
+    "agzo_plain": AGZOPlainTrainer,   # activation-guided, plain basis (no H_diff)
 }
 
 

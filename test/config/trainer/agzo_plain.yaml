@@ -1,0 +1,14 @@
+# config/trainer/agzo_plain.yaml
+# Plain-AGZO: activation-guided ZO without the H_diff preference subspace.
+#
+# Identical hyperparameters to agzo.yaml.
+# Use as an ablation baseline:
+#   trainer=agzo_plain   activation guidance, raw activation basis
+#   trainer=agzo         activation guidance + H_diff preference subspace
+
+name: agzo_plain
+
+lr: 1e-6
+eps: 1e-3
+power_iter_steps: 5
+rank: 1
