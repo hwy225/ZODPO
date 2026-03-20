@@ -347,6 +347,7 @@ class ZOTrainerBase:
             # max_steps=self.total_batches, # only for test
 
             per_device_train_batch_size=self.config.batch_size,
+            gradient_accumulation_steps=int(self.config.get("gradient_accumulation_steps", 1)),
             learning_rate=float(sft_cfg.get("lr", 5e-5)),
             lr_scheduler_type=sft_cfg.get("lr_scheduler_type", "cosine"),
             warmup_ratio=float(sft_cfg.get("warmup_ratio", 0.03)),
@@ -356,7 +357,7 @@ class ZOTrainerBase:
             logging_steps=10,
             save_strategy="steps",
             save_steps=500,
-            save_total_limit=2,
+            save_total_limit=1,
             bf16=(self.config.model.policy_dtype == "bfloat16"),
             fp16=(self.config.model.policy_dtype == "float16"),
             report_to="wandb" if self.config.wandb.enabled else "none",

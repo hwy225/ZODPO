@@ -11,7 +11,8 @@ seed: 42
 exp_name: ???           # MUST be set on the command line
 
 # ── Data ─────────────────────────────────────────────────────
-batch_size: 16
+batch_size: 4
+gradient_accumulation_steps: 16
 max_length: 512          # max total sequence length (prompt + response)
 max_prompt_length: 256   # max prompt length before truncation
 total_batches: 100       # how many batches to cache and train on
@@ -20,14 +21,14 @@ total_batches: 100       # how many batches to cache and train on
 wandb:
   enabled: true
   entity: "weiyunh225-uppsala-universitet"
-  project: "zo-dpo-server"
+  project: "zo-dpo"
 
 # ── Storage directories ───────────────────────────────────────
-hf_cache_dir: "/media/tsar_bomba/$USER/huggingface_cache"
-hf_dataset_cache_dir: "/media/tsar_bomba/$USER/datasets"
-checkpoint_dir: "/media/tsar_bomba/$USER/checkpoints"
+hf_cache_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/.cache/huggingface"
+hf_dataset_cache_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/.cache/huggingface/datasets"
+checkpoint_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/checkpoints"
 
-runs_dir: "/media/tsar_bomba/$USER/runs"
+runs_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/runs"
 checkpoint_every: 50
 
 # ── Hydra config-group defaults ──────────────────────────────
