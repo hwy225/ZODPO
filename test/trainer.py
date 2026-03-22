@@ -80,6 +80,7 @@ class ZOTrainerBase:
 
     def __init__(self, policy: nn.Module, config: DictConfig):
         self.policy        = policy
+        disable_dropout(self.policy)
         self.config        = config
         self.lr            = config.trainer.lr
         self.eps           = config.trainer.eps
@@ -188,42 +189,62 @@ class ZOTrainerBase:
                 ).logits,
                 gpu_batch['chosen_labels'],
             )
+
+            self._perturb(+1)
+            
             self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
         return ((loss_p + loss_m) / 2).item()
 
-    def _dpo_step(self, gpu_batch: dict, beta: float) -> float:
+    def _dpo_loss(self, gpu_batch: dict, beta: float) -> float:
         """
-        Two-sided ZO DPO step; chosen + rejected are concatenated to halve
-        the number of forward passes.
-        Override to inject pre-step logic (e.g. basis collection).
+        Single forward-pass DPO loss (no seed reset, no parameter update).
+        Used by _dpo_step (single batch) and _run_dpo (gradient accumulation).
         """
-        self._reset_seed()
         B    = gpu_batch['chosen_input_ids'].shape[0]
         ids, mask = self._concat_cr(gpu_batch)
-
-        def _fwd_split() -> Tuple[torch.Tensor, torch.Tensor]:
-            logits = self.policy(ids, attention_mask=mask).logits
-            return logits[:B], logits[B:]
-        
         with torch.no_grad():
             self._perturb(+1)
-            c_p, r_p = _fwd_split()
+            logits = self.policy(ids, attention_mask=mask).logits
             loss_p = compute_dpo_loss(
-                c_p, r_p,
+                logits[:B], logits[B:],
                 gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
                 gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
                 beta,
             )
             self._perturb(-2)
-            c_m, r_m = _fwd_split()
+            logits = self.policy(ids, attention_mask=mask).logits
             loss_m = compute_dpo_loss(
-                c_m, r_m,
+                logits[:B], logits[B:],
                 gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
                 gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
                 beta,
             )
-            self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
-        return ((loss_p + loss_m) / 2).item()
+            self._perturb(+1)   # restore to θ₀ after ±ε cycle
+        return loss_p.item(), loss_m.item()
+
+    def _collect_dpo_basis(self, gpu_batch: dict):
+        """
+        Hook called once per accumulation window, BEFORE _reset_seed().
+        Subclasses override this to collect the activation subspace (AGZO).
+        Base implementation is a no-op (MeZO uses isotropic perturbation).
+        """
+        pass
+
+    def _dpo_step(self, gpu_batch: dict, beta: float) -> float:
+        """
+        Two-sided ZO DPO step (single batch, grad_accum=1 path).
+        Calls _collect_dpo_basis so subclass hooks fire correctly.
+        """
+        self._collect_dpo_basis(gpu_batch)
+        self._reset_seed()
+        loss_p, loss_m = self._dpo_loss(gpu_batch, beta)
+        g_hat = (loss_p - loss_m) / (2 * self.eps)
+        
+        clip_val = 20.0
+        g_hat = max(min(g_hat, clip_val), -clip_val)
+        
+        self._apply_update(g_hat)
+        return (loss_p + loss_m) / 2
 
     # ================================================================
     # Main entry
@@ -233,29 +254,11 @@ class ZOTrainerBase:
         stage = self.config.loss.name   # "sft" | "dpo"
 
         if stage == "sft":
-            # Standard gradient-based SFT via TRL SFTTrainer.
-            # No ZO loop, no batch caching.
             self._run_sft_standard()
             return
 
-        # DPO (and any future ZO stages): cache batches to CPU RAM first.
-        print(f"Caching {self.total_batches} batches ...")
-        cached_batches: List[dict] = []
-        it = get_chat_template_iterator(
-            tokenizer=self.tokenizer,
-            split='train',
-            batch_size=self.config.batch_size,
-            n_examples=self.total_batches * self.config.batch_size,
-            max_length=self.config.max_length,
-            max_prompt_length=self.config.max_prompt_length,
-            shuffle=True,
-            cache_dir=self.dataset_cache_dir,
-        )
-        for _ in tqdm.tqdm(range(self.total_batches), desc="Loading"):
-            cached_batches.append(next(it))
-
         if stage == "dpo":
-            self._run_dpo(cached_batches, beta=self.config.loss.beta)
+            self._run_dpo(beta=self.config.loss.beta)
         else:
             raise ValueError(
                 f"Unknown loss.name: {stage!r}.  Valid choices: 'sft', 'dpo'."
@@ -414,65 +417,220 @@ class ZOTrainerBase:
 
         self.save_final("sft")
 
-    def _run_dpo(self, cached_batches: List[dict], beta: float):
-        # ── load frozen reference model, compute ref logps ──────────
-        ref_path  = self.config.loss.sft_model_path
-        dtype     = getattr(torch, self.config.model.policy_dtype)
+    def _run_dpo(self, beta: float):
+        """
+        ZO-DPO training loop with gradient accumulation and disk-cached ref logps.
 
-        print(f"\n--- Pre-computing ref logps  (ref: {ref_path}) ---")
-        ref_model = transformers.AutoModelForCausalLM.from_pretrained(
-            ref_path,
-            cache_dir=self.hf_model_cache,
-            torch_dtype=dtype,
-            device_map=self.accelerator.device,
+        Gradient accumulation
+        ---------------------
+        Standard gradient accumulation doesn't apply to ZO (no backprop), but
+        we can achieve the same effect of a larger effective batch size by
+        averaging the projected gradient estimate across `grad_accum` mini-batches
+        before applying the update.  All mini-batches in one accumulation window
+        share the same ZO seed (same perturbation direction z), so:
+
+            g_hat = mean_i [ (loss+_i - loss-_i) / (2*eps) ]
+
+        This is mathematically equivalent to computing the ZO estimate on a
+        single batch of size batch_size * grad_accum.
+
+        One "optimizer step" = grad_accum mini-batches.
+        `global_step` counts optimizer steps (not mini-batch steps).
+        `checkpoint_every` and wandb logging are also in optimizer steps.
+
+        Ref logp cache
+        --------------
+        Cache filename encodes model short-name and effective batch size so
+        the file is never accidentally reused with different settings.
+        Stored in checkpoints/<exp>/dpo/ alongside checkpoint.pt.
+        """
+        import random
+
+        loss_cfg   = self.config.loss
+        ref_path   = loss_cfg.sft_model_path
+        dtype      = getattr(torch, self.config.model.policy_dtype)
+        n_epochs   = int(loss_cfg.get("num_epochs", 1))
+        grad_accum = int(self.config.get("gradient_accumulation_steps", 1))
+
+        # effective batch size seen per optimizer step
+        eff_bs = self.config.batch_size * grad_accum
+
+        # ── decide data volume ────────────────────────────────────────
+        use_full_dataset = (loss_cfg.get("num_epochs", None) is not None)
+        n_examples = None if use_full_dataset else self.total_batches * self.config.batch_size
+
+        # ── ref logp cache path ───────────────────────────────────────
+        # The cache depends only on the ref model and batch_size, not on
+        # the current exp_name.  We store it next to the SFT final_model
+        # so all DPO experiments that share the same ref model reuse it.
+        #
+        # ref_path is typically:
+        #   <runs_dir>/<sft_exp>/sft/final_model
+        # We place the cache one level up:
+        #   <runs_dir>/<sft_exp>/sft/ref_logps_bs<B>_<model>.pt
+        #
+        # That way:
+        #   - cache is tied to the SFT run, not to any specific DPO exp
+        #   - multiple DPO experiments (mezo, agzo, agzo_plain) sharing
+        #     the same SFT checkpoint all hit the same cache file
+        #   - deleting the SFT run also cleans up its cache naturally
+        model_short = os.path.basename(
+            os.path.normpath(self.config.model.name_or_path)
+        ).replace(" ", "_")
+        sft_stage_dir = os.path.dirname(os.path.normpath(ref_path))  # strip final_model/
+        os.makedirs(sft_stage_dir, exist_ok=True)
+        cache_file = os.path.join(
+            sft_stage_dir,
+            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}.pt"
         )
-        ref_model.eval()
-        disable_dropout(ref_model)
 
-        with torch.no_grad():
-            for batch in tqdm.tqdm(cached_batches, desc="Ref logps"):
-                gb = {
-                    k: batch[k].to(self.accelerator.device)
-                    for k in [
-                        'chosen_input_ids',   'chosen_attention_mask',   'chosen_labels',
-                        'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels',
-                    ]
-                }
-                B   = gb['chosen_input_ids'].shape[0]
-                ids = torch.cat([gb['chosen_input_ids'],      gb['rejected_input_ids']],      dim=0)
-                msk = torch.cat([gb['chosen_attention_mask'], gb['rejected_attention_mask']], dim=0)
-                all_logits = ref_model(ids, attention_mask=msk).logits
+        # ── compute or load ref logps ─────────────────────────────────
+        if os.path.exists(cache_file):
+            print(f"\n--- [Cache Hit] Loading ref logps from {cache_file} ---")
+            ref_logps: List[Tuple[torch.Tensor, torch.Tensor]] = torch.load(
+                cache_file, map_location="cpu", weights_only=True
+            )
+        else:
+            print(f"\n--- [Cache Miss] Computing ref logps (one-time cost) ---")
+            ref_model = transformers.AutoModelForCausalLM.from_pretrained(
+                ref_path,
+                cache_dir=self.hf_model_cache,
+                torch_dtype=dtype,
+                device_map=self.accelerator.device,
+            )
+            ref_model.eval()
+            disable_dropout(ref_model)
 
-                batch['ref_chosen_logps']  = get_batch_logps(all_logits[:B], gb['chosen_labels']).cpu()
-                batch['ref_rejected_logps'] = get_batch_logps(all_logits[B:], gb['rejected_labels']).cpu()
+            ref_iter = get_chat_template_iterator(
+                tokenizer=self.tokenizer,
+                split='train',
+                batch_size=self.config.batch_size,   # mini-batch size, same as training
+                n_epochs=1,
+                n_examples=n_examples,
+                max_length=self.config.max_length,
+                max_prompt_length=self.config.max_prompt_length,
+                shuffle=False,          # fixed order so indices stay stable
+                cache_dir=self.dataset_cache_dir,
+            )
 
-        del ref_model
-        torch.cuda.empty_cache()
+            ref_logps = []
+            with torch.no_grad():
+                for batch in tqdm.tqdm(ref_iter, desc="Ref logps"):
+                    gb = {k: batch[k].to(self.accelerator.device)
+                          for k in ['chosen_input_ids',   'chosen_attention_mask',   'chosen_labels',
+                                    'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels']}
+                    B   = gb['chosen_input_ids'].shape[0]
+                    ids = torch.cat([gb['chosen_input_ids'],      gb['rejected_input_ids']],      dim=0)
+                    msk = torch.cat([gb['chosen_attention_mask'], gb['rejected_attention_mask']], dim=0)
+                    all_logits = ref_model(ids, attention_mask=msk).logits
+                    ref_logps.append((
+                        get_batch_logps(all_logits[:B], gb['chosen_labels']).cpu(),
+                        get_batch_logps(all_logits[B:], gb['rejected_labels']).cpu(),
+                    ))
 
-        # ── DPO training ─────────────────────────────────────────────
-        print("\n--- DPO ---")
+            tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}"
+            torch.save(ref_logps, tmp_cache_file)
+            os.replace(tmp_cache_file, cache_file)
+            
+            print(f"  [Cache Saved] {len(ref_logps)} mini-batches -> {cache_file}")
+            del ref_model
+            torch.cuda.empty_cache()
 
+        n_batches = len(ref_logps)
+        print(f"\n--- DPO ({n_epochs} epoch(s), {n_batches} mini-batches/epoch, "
+              f"grad_accum={grad_accum}, eff_bs={eff_bs}) ---")
+
+        # ── resume ───────────────────────────────────────────────────
+        # global_step counts optimizer steps (one step = grad_accum mini-batches)
         resume_step, loss_history = self._try_resume("dpo")
         if resume_step > 0:
-            print(f"  Resuming DPO from step {resume_step + 1} / {len(cached_batches)}")
+            print(f"  Resuming DPO from optimizer step {resume_step + 1}")
 
         self.policy.train()
-        total = len(cached_batches)
+        global_step = 1         # optimizer step counter
 
-        for step, batch in enumerate(cached_batches, 1):
-            if step <= resume_step:
-                continue
+        for epoch in range(n_epochs):
+            print(f"\nEpoch {epoch + 1}/{n_epochs}")
 
-            gpu_batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
-            loss = self._dpo_step(gpu_batch, beta=beta)
-            loss_history.append(loss)
+            # Shuffle mini-batch indices; ref_logps[idx] stays in sync
+            indices = list(range(n_batches))
+            random.shuffle(indices)
 
-            if self.accelerator.is_main_process:
-                print(f"DPO {step}/{total} | loss={loss:.4f}")
-                wandb.log({"train/dpo_loss": loss, "step": step})
+            # Load all mini-batches for this epoch in fixed order
+            train_iter = get_chat_template_iterator(
+                tokenizer=self.tokenizer,
+                split='train',
+                batch_size=self.config.batch_size,
+                n_epochs=1,
+                n_examples=n_examples,
+                max_length=self.config.max_length,
+                max_prompt_length=self.config.max_prompt_length,
+                shuffle=False,
+                cache_dir=self.dataset_cache_dir,
+            )
+            epoch_batches = list(tqdm.tqdm(train_iter,
+                                           desc=f"Loading epoch {epoch+1}",
+                                           leave=False))
 
-            if step % self.checkpoint_every == 0:
-                self._save_checkpoint("dpo", step, loss_history)
+            # Iterate over mini-batches in groups of grad_accum
+            for window_start in tqdm.tqdm(
+                range(0, len(indices), grad_accum),
+                desc=f"DPO (Epoch {epoch + 1})"
+            ):
+                if global_step <= resume_step:
+                    global_step += 1
+                    continue
+
+                window = indices[window_start : window_start + grad_accum]
+
+                # ── ZO gradient accumulation ──────────────────────────
+                # Collect basis once per window using the first mini-batch
+                # (basis is shared across all mini-batches in the window).
+                # This must happen BEFORE _reset_seed so that AGZO's
+                # _perturb can use the freshly computed subspace.
+                first_batch = epoch_batches[window[0]]
+                first_ref_c, first_ref_r = ref_logps[window[0]]
+                first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
+                first_gpu['ref_chosen_logps']  = first_ref_c.to(self.accelerator.device)
+                first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
+                self._collect_dpo_basis(first_gpu)
+
+                # All mini-batches in this window share the same seed (same z)
+                self._reset_seed()
+                accum_g_hat = 0.0
+                accum_loss  = 0.0
+
+                for idx in window:
+                    batch = epoch_batches[idx]
+                    ref_chosen_logps, ref_rejected_logps = ref_logps[idx]
+
+                    gpu_batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
+                    gpu_batch['ref_chosen_logps']  = ref_chosen_logps.to(self.accelerator.device)
+                    gpu_batch['ref_rejected_logps'] = ref_rejected_logps.to(self.accelerator.device)
+
+                    loss_p, loss_m = self._dpo_loss(gpu_batch, beta)
+                    accum_g_hat += (loss_p - loss_m) / (2 * self.eps)
+                    accum_loss  += (loss_p + loss_m) / 2
+
+                # Average over the window and apply one update
+                g_hat = accum_g_hat / len(window)
+                clip_val = 20.0
+                g_hat = max(min(g_hat, clip_val), -clip_val)
+                avg_loss = accum_loss / len(window)
+                self._apply_update(g_hat)
+                loss_history.append(avg_loss)
+
+                if self.accelerator.is_main_process:
+                    print(f"DPO step {global_step} (e{epoch+1}) | "
+                          f"loss={avg_loss:.4f} | eff_bs={len(window)*self.config.batch_size}")
+                    wandb.log({"train/dpo_loss": avg_loss,
+                               "step": global_step,
+                               "epoch": epoch + 1})
+
+                if global_step % self.checkpoint_every == 0:
+                    self._save_checkpoint("dpo", global_step, loss_history)
+
+                global_step += 1
 
         self.save_final("dpo")
 
@@ -637,6 +795,8 @@ class ZOTrainerBase:
         unwrapped   = self.accelerator.unwrap_model(self.policy)
         unwrapped.save_pretrained(out_dir, state_dict=state_dict)
 
+        self.tokenizer.save_pretrained(out_dir)
+
         print(f"  [final] Model saved --> {out_dir}")
         self.accelerator.wait_for_everyone()
 
@@ -680,7 +840,7 @@ class MeZOTrainer(ZOTrainerBase):
         torch.manual_seed(self._zo_seed)
         for p in self._params:
             z = torch.randn_like(p)
-            p.data.add_(z, alpha=self.eps - self.lr * projected_grad)
+            p.data.add_(z, alpha= - self.lr * projected_grad)
 
 
 # ============================================================
@@ -919,39 +1079,17 @@ class AGZOTrainer(ZOTrainerBase):
             self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
         return ((loss_p + loss_m) / 2).item()
 
-    def _dpo_step(self, gpu_batch: dict, beta: float) -> float:
-        self._reset_seed()
+    def _collect_dpo_basis(self, gpu_batch: dict):
+        """Collect H_diff activation subspace for the DPO perturbation direction."""
         B    = gpu_batch['chosen_input_ids'].shape[0]
         ids, mask = self._concat_cr(gpu_batch)
-
         self._engine.collect_dpo(
             lambda: self.policy(ids, attention_mask=mask),
             B=B,
         )
 
-        def _fwd_split() -> Tuple[torch.Tensor, torch.Tensor]:
-            logits = self.policy(ids, attention_mask=mask).logits
-            return logits[:B], logits[B:]
-        
-        with torch.no_grad():
-            self._perturb(+1)
-            c_p, r_p = _fwd_split()
-            loss_p = compute_dpo_loss(
-                c_p, r_p,
-                gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
-                gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
-                beta,
-            )
-            self._perturb(-2)
-            c_m, r_m = _fwd_split()
-            loss_m = compute_dpo_loss(
-                c_m, r_m,
-                gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
-                gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
-                beta,
-            )
-            self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
-        return ((loss_p + loss_m) / 2).item()
+    # _dpo_step is inherited from ZOTrainerBase:
+    #   _collect_dpo_basis → _reset_seed → _dpo_loss → _apply_update
 
     def _perturb(self, scaling: float):
         torch.manual_seed(self._zo_seed)
@@ -963,7 +1101,7 @@ class AGZOTrainer(ZOTrainerBase):
         torch.manual_seed(self._zo_seed)
         for name, param in self._params:
             z = self._engine.sample_z(name, param)
-            param.data.add_(z, alpha=self.eps - self.lr * projected_grad)
+            param.data.add_(z, alpha= - self.lr * projected_grad)
 
     def cleanup(self):
         self._engine.remove_hooks()
@@ -994,41 +1132,16 @@ class AGZOPlainTrainer(AGZOTrainer):
     # _sft_step is inherited unchanged from AGZOTrainer (already uses collect_sft
     # which is plain-activation, so no override needed).
 
-    def _dpo_step(self, gpu_batch: dict, beta: float) -> float:
-        self._reset_seed()
+    def _collect_dpo_basis(self, gpu_batch: dict):
+        """Collect plain activation subspace (no H_diff) for DPO perturbation."""
         B    = gpu_batch['chosen_input_ids'].shape[0]
         ids, mask = self._concat_cr(gpu_batch)
-
-        # KEY DIFFERENCE: collect_plain instead of collect_dpo
-        # The subspace is built from the raw concatenated activations
-        # without splitting or differencing chosen vs rejected.
         self._engine.collect_plain(
             lambda: self.policy(ids, attention_mask=mask)
         )
 
-        def _fwd_split() -> Tuple[torch.Tensor, torch.Tensor]:
-            logits = self.policy(ids, attention_mask=mask).logits
-            return logits[:B], logits[B:]
-
-        with torch.no_grad():
-            self._perturb(+1)
-            c_p, r_p = _fwd_split()
-            loss_p = compute_dpo_loss(
-                c_p, r_p,
-                gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
-                gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
-                beta,
-            )
-            self._perturb(-2)
-            c_m, r_m = _fwd_split()
-            loss_m = compute_dpo_loss(
-                c_m, r_m,
-                gpu_batch['ref_chosen_logps'], gpu_batch['ref_rejected_logps'],
-                gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
-                beta,
-            )
-            self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
-        return ((loss_p + loss_m) / 2).item()
+    # _dpo_step is inherited from ZOTrainerBase via AGZOTrainer:
+    #   _collect_dpo_basis → _reset_seed → _dpo_loss → _apply_update
 
 
 # ============================================================
