@@ -195,15 +195,22 @@ class ZOTrainerBase:
             self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
         return ((loss_p + loss_m) / 2).item()
 
-    def _dpo_loss(self, gpu_batch: dict, beta: float) -> float:
+    def _dpo_loss(self, gpu_batch: dict, beta: float) -> Tuple[float, float]:
         """
-        Single forward-pass DPO loss (no seed reset, no parameter update).
-        Used by _dpo_step (single batch) and _run_dpo (gradient accumulation).
+        Compute DPO loss at θ+ε·z and θ-ε·z.
+
+        Assumes the caller has already:
+          1. called _reset_seed() to fix the ZO seed
+          2. NOT yet perturbed the model (model is at θ₀ on entry)
+
+        After this call the model is restored to θ₀.
+        This method calls _perturb itself so the caller only needs to
+        manage the seed, not the parameter state.
         """
         B    = gpu_batch['chosen_input_ids'].shape[0]
         ids, mask = self._concat_cr(gpu_batch)
         with torch.no_grad():
-            self._perturb(+1)
+            self._perturb(+1)                             # θ₀ → θ₀ + ε·z
             logits = self.policy(ids, attention_mask=mask).logits
             loss_p = compute_dpo_loss(
                 logits[:B], logits[B:],
@@ -211,7 +218,7 @@ class ZOTrainerBase:
                 gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
                 beta,
             )
-            self._perturb(-2)
+            self._perturb(-2)                             # θ₀ + ε·z → θ₀ - ε·z
             logits = self.policy(ids, attention_mask=mask).logits
             loss_m = compute_dpo_loss(
                 logits[:B], logits[B:],
@@ -219,7 +226,7 @@ class ZOTrainerBase:
                 gpu_batch['chosen_labels'],    gpu_batch['rejected_labels'],
                 beta,
             )
-            self._perturb(+1)   # restore to θ₀ after ±ε cycle
+            self._perturb(+1)                             # θ₀ - ε·z → θ₀  (restored)
         return loss_p.item(), loss_m.item()
 
     def _collect_dpo_basis(self, gpu_batch: dict):
@@ -240,7 +247,7 @@ class ZOTrainerBase:
         loss_p, loss_m = self._dpo_loss(gpu_batch, beta)
         g_hat = (loss_p - loss_m) / (2 * self.eps)
         
-        clip_val = 20.0
+        clip_val = 0.05 / self.eps
         g_hat = max(min(g_hat, clip_val), -clip_val)
         
         self._apply_update(g_hat)
@@ -474,14 +481,11 @@ class ZOTrainerBase:
         #   - multiple DPO experiments (mezo, agzo, agzo_plain) sharing
         #     the same SFT checkpoint all hit the same cache file
         #   - deleting the SFT run also cleans up its cache naturally
-        model_short = os.path.basename(
-            os.path.normpath(self.config.model.name_or_path)
-        ).replace(" ", "_")
         sft_stage_dir = os.path.dirname(os.path.normpath(ref_path))  # strip final_model/
         os.makedirs(sft_stage_dir, exist_ok=True)
         cache_file = os.path.join(
             sft_stage_dir,
-            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}.pt"
+            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}_{dtype.split('.')[1]}.pt"
         )
 
         # ── compute or load ref logps ─────────────────────────────────
@@ -584,10 +588,21 @@ class ZOTrainerBase:
                 window = indices[window_start : window_start + grad_accum]
 
                 # ── ZO gradient accumulation ──────────────────────────
-                # Collect basis once per window using the first mini-batch
-                # (basis is shared across all mini-batches in the window).
-                # This must happen BEFORE _reset_seed so that AGZO's
-                # _perturb can use the freshly computed subspace.
+                # Each mini-batch in the window gets its own independent
+                # perturbation direction z_i (different seed per mini-batch).
+                # This gives independent gradient estimates that we average:
+                #
+                #   g_hat = (1/N) * Σ_i [ (L(θ+ε·z_i) - L(θ-ε·z_i)) / (2ε) ]
+                #
+                # This is a lower-variance estimator than reusing the same z
+                # for all mini-batches (which would just scale one estimate by N).
+                #
+                # For _apply_update we need a single seed. We use a fresh
+                # "update seed" and store per-mini-batch seeds to replay z_i
+                # weighted by their g_hat contribution.
+                # SIMPLER equivalent: accumulate the parameter delta directly.
+
+                # Collect basis once per window (AGZO: uses first mini-batch)
                 first_batch = epoch_batches[window[0]]
                 first_ref_c, first_ref_r = ref_logps[window[0]]
                 first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
@@ -595,10 +610,13 @@ class ZOTrainerBase:
                 first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
                 self._collect_dpo_basis(first_gpu)
 
-                # All mini-batches in this window share the same seed (same z)
-                self._reset_seed()
-                accum_g_hat = 0.0
-                accum_loss  = 0.0
+                accum_loss = 0.0
+                # Accumulate parameter updates directly (θ_delta = -lr * g_hat_i * z_i)
+                # by doing a full ZO step per mini-batch but with lr/N so the
+                # total update magnitude is equivalent to one step on a batch of N.
+                scaled_lr = self.lr / len(window)
+                original_lr = self.lr
+                self.lr = scaled_lr
 
                 for idx in window:
                     batch = epoch_batches[idx]
@@ -608,24 +626,33 @@ class ZOTrainerBase:
                     gpu_batch['ref_chosen_logps']  = ref_chosen_logps.to(self.accelerator.device)
                     gpu_batch['ref_rejected_logps'] = ref_rejected_logps.to(self.accelerator.device)
 
+                    self._reset_seed()                           # fresh z for each mini-batch
                     loss_p, loss_m = self._dpo_loss(gpu_batch, beta)
-                    accum_g_hat += (loss_p - loss_m) / (2 * self.eps)
-                    accum_loss  += (loss_p + loss_m) / 2
+                    g_hat = (loss_p - loss_m) / (2 * self.eps)
 
-                # Average over the window and apply one update
-                g_hat = accum_g_hat / len(window)
-                clip_val = 20.0
-                g_hat = max(min(g_hat, clip_val), -clip_val)
+                    clip_val = 0.05 / self.eps
+                    g_hat = max(min(g_hat, clip_val), -clip_val)
+
+                    self._apply_update(g_hat)                    # θ += -scaled_lr * g_hat * z
+                    accum_loss += (loss_p + loss_m) / 2
+
+                self.lr = original_lr                            # restore lr
                 avg_loss = accum_loss / len(window)
-                self._apply_update(g_hat)
                 loss_history.append(avg_loss)
 
                 if self.accelerator.is_main_process:
                     print(f"DPO step {global_step} (e{epoch+1}) | "
                           f"loss={avg_loss:.4f} | eff_bs={len(window)*self.config.batch_size}")
-                    wandb.log({"train/dpo_loss": avg_loss,
-                               "step": global_step,
-                               "epoch": epoch + 1})
+                    wandb.log({
+                        "train/dpo_loss":    avg_loss,
+                        "train/loss_minus_log2": avg_loss - math.log(2),  # deviation from init
+                        "step":  global_step,
+                        "epoch": epoch + 1,
+                        "hparams/lr":    self.lr,
+                        "hparams/eps":   self.eps,
+                        "hparams/beta":  beta,
+                        "hparams/eff_bs": len(window) * self.config.batch_size,
+                    })
 
                 if global_step % self.checkpoint_every == 0:
                     self._save_checkpoint("dpo", global_step, loss_history)
