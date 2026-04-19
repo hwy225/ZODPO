@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -72,6 +73,88 @@ def disable_dropout(model: nn.Module):
 
 
 # ============================================================
+# Eval helpers
+# ============================================================
+
+@torch.no_grad()
+def compute_dpo_eval_metrics(
+    policy:             nn.Module,
+    ref_chosen_logps:   torch.Tensor,
+    ref_rejected_logps: torch.Tensor,
+    gpu_batch:          dict,
+    beta:               float,
+    compute_fp32:       bool = True,
+) -> dict:
+    policy.eval()
+    B    = gpu_batch['chosen_input_ids'].shape[0]
+    ids  = torch.cat([gpu_batch['chosen_input_ids'],      gpu_batch['rejected_input_ids']],      dim=0)
+    mask = torch.cat([gpu_batch['chosen_attention_mask'], gpu_batch['rejected_attention_mask']], dim=0)
+
+    logits_all = policy(ids, attention_mask=mask).logits   # (2B, T, V)
+
+    logits_chosen_mean = logits_all[:B].detach().float().mean()
+    logits_rejected_mean = logits_all[B:].detach().float().mean()
+
+    pi_c_logps = get_batch_logps(logits_all[:B], gpu_batch['chosen_labels'],   compute_fp32)  
+    pi_r_logps = get_batch_logps(logits_all[B:], gpu_batch['rejected_labels'], compute_fp32)  
+
+    ref_c = ref_chosen_logps.to(pi_c_logps.device)
+    ref_r = ref_rejected_logps.to(pi_r_logps.device)
+
+    reward_chosen   = beta * (pi_c_logps - ref_c)   
+    reward_rejected = beta * (pi_r_logps - ref_r)   
+    margins         = reward_chosen - reward_rejected  
+    accuracies      = (margins > 0).float()            
+
+    ratios = margins                                   
+    dpo_loss = -F.logsigmoid(ratios).mean()
+
+    policy.train()
+
+    return {
+        "_reward_chosen_sum":   reward_chosen.sum(),
+        "_reward_rejected_sum": reward_rejected.sum(),
+        "_margin_sum":          margins.sum(),
+        "_accuracy_sum":        accuracies.sum(),
+        "_logps_chosen_sum":    pi_c_logps.sum(),
+        "_logps_rejected_sum":  pi_r_logps.sum(),
+        "_logits_chosen_sum":   logits_chosen_mean * B,  
+        "_logits_rejected_sum": logits_rejected_mean * B,
+        "_loss_sum":            dpo_loss * B,     
+        "_count":               torch.tensor(float(B), device=pi_c_logps.device),
+    }
+
+
+def _all_reduce_eval_stats(stats: dict, accelerator) -> dict:
+    keys_order = [
+        "_reward_chosen_sum", "_reward_rejected_sum", "_margin_sum",
+        "_accuracy_sum", "_logps_chosen_sum", "_logps_rejected_sum",
+        "_logits_chosen_sum", "_logits_rejected_sum",
+        "_loss_sum", "_count",
+    ]
+    if accelerator.num_processes == 1:
+        vec = torch.stack([stats[k] for k in keys_order])
+    else:
+        vec = torch.stack([stats[k] for k in keys_order]).to(accelerator.device)
+        dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+        
+    count = vec[-1].item()
+
+    return {
+        "eval/rewards/chosen":     (vec[0] / count).item(),
+        "eval/rewards/rejected":   (vec[1] / count).item(),
+        "eval/rewards/margins":    (vec[2] / count).item(),
+        "eval/rewards/accuracies": (vec[3] / count).item(),
+        "eval/logps/chosen":       (vec[4] / count).item(),
+        "eval/logps/rejected":     (vec[5] / count).item(),
+        "eval/logits/chosen":      (vec[6] / count).item(),
+        "eval/logits/rejected":    (vec[7] / count).item(),
+        "eval/loss":               (vec[8] / count).item(),
+        "_total_samples":          count,
+    }
+
+
+# ============================================================
 # ZOTrainerBase
 # ============================================================
 
@@ -134,6 +217,14 @@ class ZOTrainerBase:
 
         self.checkpoint_every: int = int(config.get("checkpoint_every", 20))
         self.resumed_wandb_run_id: Optional[str] = None
+
+        # ── eval config ─────────────────────────────────────────────
+        # eval_every: run eval every N optimizer steps  (0 = disable)
+        self.eval_every: int = int(config.get("eval_every", 0))
+        # eval_batches: how many eval mini-batches to use  (None = all)
+        self.eval_batches: Optional[int] = config.get("eval_batches", None)
+        if self.eval_batches is not None:
+            self.eval_batches = int(self.eval_batches)
 
     # ================================================================
     # Abstract interface
@@ -212,7 +303,6 @@ class ZOTrainerBase:
                 compute_fp32=self.compute_logps_fp32
             )
 
-            # self._perturb(+1)
             for p, saved_w in zip(active_params, saved_weights):
                 p.data.copy_(saved_w)
             
@@ -249,7 +339,6 @@ class ZOTrainerBase:
                 beta,
                 compute_fp32=self.compute_logps_fp32
             )
-            # self._perturb(+1)   # restore to θ₀ after ±ε cycle
             for p, saved_w in zip(active_params, saved_weights):
                 p.data.copy_(saved_w)
 
@@ -269,6 +358,97 @@ class ZOTrainerBase:
         
         self._apply_update(g_hat)
         return (loss_p + loss_m) / 2
+
+    # ================================================================
+    # Eval loop
+    # ================================================================
+
+    def _run_eval(
+        self,
+        eval_batches_list: List[dict],  # list of CPU batches (no ref_logps yet)
+        ref_eval_logps:    List[Tuple[torch.Tensor, torch.Tensor]],  # parallel list
+        beta:              float,
+        global_step:       int,
+        wandb_enabled:     bool,
+    ):
+        """
+        Evaluate the policy on `eval_batches_list` and log to WandB.
+        Multi-GPU aware: each rank processes a slice, then all_reduce.
+
+        Mirrors exactly the metrics visible in your WandB screenshots:
+          rewards_eval/{chosen, rejected, margins, accuracies}
+          logps_eval/{chosen, rejected}
+          loss/eval
+        """
+        n_eval = len(eval_batches_list)
+        if self.eval_batches is not None:
+            n_eval = min(n_eval, self.eval_batches)
+
+        if n_eval == 0:
+            return
+
+        if self.accelerator.is_main_process:
+            print(f"\n  [eval] Running eval on {n_eval} batches …")
+
+        n_proc = self.accelerator.num_processes
+        rank   = self.accelerator.process_index
+
+        # Accumulators (device tensors, summed locally then all_reduced)
+        acc = {
+            "_reward_chosen_sum":   torch.tensor(0.0, device=self.accelerator.device),
+            "_reward_rejected_sum": torch.tensor(0.0, device=self.accelerator.device),
+            "_margin_sum":          torch.tensor(0.0, device=self.accelerator.device),
+            "_accuracy_sum":        torch.tensor(0.0, device=self.accelerator.device),
+            "_logps_chosen_sum":    torch.tensor(0.0, device=self.accelerator.device),
+            "_logps_rejected_sum":  torch.tensor(0.0, device=self.accelerator.device),
+            "_logits_chosen_sum":   torch.tensor(0.0, device=self.accelerator.device),
+            "_logits_rejected_sum": torch.tensor(0.0, device=self.accelerator.device),
+            "_loss_sum":            torch.tensor(0.0, device=self.accelerator.device),
+            "_count":               torch.tensor(0.0, device=self.accelerator.device),
+        }
+        start_time = time.time()
+
+        for i in range(n_eval):
+            # Distribute eval batches across ranks (same scheme as DPO train)
+            if i % n_proc != rank:
+                continue
+
+            batch = eval_batches_list[i]
+            ref_c, ref_r = ref_eval_logps[i]
+
+            gpu_batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
+
+            batch_stats = compute_dpo_eval_metrics(
+                policy=self.policy,
+                ref_chosen_logps=ref_c,
+                ref_rejected_logps=ref_r,
+                gpu_batch=gpu_batch,
+                beta=beta,
+                compute_fp32=self.compute_logps_fp32,
+            )
+
+            for k in acc:
+                acc[k] += batch_stats[k].to(self.accelerator.device)
+
+        # ── all_reduce across ranks ──────────────────────────────────
+        metrics = _all_reduce_eval_stats(acc, self.accelerator)
+
+        eval_runtime = max(time.time() - start_time, 0.001)
+        total_samples = metrics.pop("_total_samples")
+        
+        metrics["eval/runtime"] = eval_runtime
+        metrics["eval/samples_per_second"] = total_samples / eval_runtime
+        metrics["eval/steps_per_second"] = n_eval / eval_runtime
+
+        if self.accelerator.is_main_process:
+            print(
+                f"  [eval step={global_step}] "
+                f"loss={metrics['eval/loss']:.4f} | "
+                f"acc={metrics['eval/rewards/accuracies']:.3f} | "
+                f"margin={metrics['eval/rewards/margins']:.4f}"
+            )
+            if wandb_enabled:
+                wandb.log({**metrics, "train/global_step": global_step})
 
     # ================================================================
     # Main entry
@@ -370,9 +550,9 @@ class ZOTrainerBase:
             completion_only_loss=True,   
             logging_steps=10,
 
-            eval_strategy="steps",  # 新版 transformers 中参数名变更为 eval_strategy
-            eval_steps=500,               # 每训练 500 步执行一次评估 (具体数值根据你的总 step 调整)
-            per_device_eval_batch_size=4, # 评估时的批次大小 (尽量设大一点以加快评估速度，不爆显存即可)
+            eval_strategy="steps",
+            eval_steps=500,
+            per_device_eval_batch_size=4,
 
             save_strategy="steps",
             save_steps=500,
@@ -449,32 +629,14 @@ class ZOTrainerBase:
             )
         else:
             print(f"\n--- [Cache Miss] Computing ref logps (one-time cost) ---")
-            # Each rank loads the ref model on its own device.
-            # Only rank 0 will write the cache file; others wait at the barrier below.
             ref_model = transformers.AutoModelForCausalLM.from_pretrained(
                 ref_path,
                 cache_dir=self.hf_model_cache,
-                torch_dtype=bfloat16,   # ref model always in bfloat16 to save VRAM
+                torch_dtype=torch.bfloat16,
                 device_map=self.accelerator.device,
             )
             ref_model.eval()
             disable_dropout(ref_model)
-
-            ref_iter = get_chat_template_iterator(
-                tokenizer=self.tokenizer,
-                split='train',
-                batch_size=self.config.batch_size,   
-                n_epochs=1,
-                n_examples=n_examples,
-                max_length=self.config.max_length,
-                max_prompt_length=self.config.max_prompt_length,
-                shuffle=False,          
-                cache_dir=self.dataset_cache_dir,
-            )
-
-            ref_logps = []
-            n_proc_ref = self.accelerator.num_processes
-            rank_ref   = self.accelerator.process_index
 
             with torch.no_grad():
                 all_batches = list(tqdm.tqdm(
@@ -490,10 +652,11 @@ class ZOTrainerBase:
                         cache_dir=self.dataset_cache_dir,
                     ),
                     desc="Loading for ref logps",
-                    disable=(rank_ref != 0),
+                    disable=(self.accelerator.process_index != 0),
                 ))
 
-                # Each rank computes its slice; we assemble in order afterward.
+                n_proc_ref = self.accelerator.num_processes
+                rank_ref   = self.accelerator.process_index
                 local_results: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
                 for i, batch in enumerate(tqdm.tqdm(
                     all_batches,
@@ -501,7 +664,7 @@ class ZOTrainerBase:
                     disable=(rank_ref != 0),
                 )):
                     if i % n_proc_ref != rank_ref:
-                        continue   # another rank handles this batch
+                        continue
                     gb = {k: batch[k].to(self.accelerator.device)
                           for k in ['chosen_input_ids',   'chosen_attention_mask',   'chosen_labels',
                                     'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels']}
@@ -514,7 +677,6 @@ class ZOTrainerBase:
                         get_batch_logps(all_logits[B:], gb['rejected_labels'], self.compute_logps_fp32).cpu(),
                     )
 
-            # Gather results from all ranks onto rank 0 and assemble in order
             if n_proc_ref > 1:
                 gathered = [None] * n_proc_ref
                 dist.all_gather_object(gathered, local_results)
@@ -525,27 +687,46 @@ class ZOTrainerBase:
             else:
                 ref_logps = [local_results[i] for i in sorted(local_results.keys())]
 
-            # Only rank 0 writes the cache (atomic write)
             if self.accelerator.is_main_process:
                 tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}"
                 torch.save(ref_logps, tmp_cache_file)
                 os.replace(tmp_cache_file, cache_file)
                 print(f"  [Cache Saved] {len(ref_logps)} mini-batches -> {cache_file}")
 
-            # All ranks must wait before proceeding (so they all load from the same cache)
             self.accelerator.wait_for_everyone()
             del ref_model
             torch.cuda.empty_cache()
+
+        # ── Prepare eval data (with cached ref logps) ────────────────
+        eval_batches_list, ref_eval_logps = self._prepare_eval_data(
+            ref_path=ref_path,
+            beta=beta,
+            n_examples=n_examples,
+        ) if self.eval_every > 0 else ([], [])
 
         n_batches = len(ref_logps)
         n_proc    = self.accelerator.num_processes
         rank      = self.accelerator.process_index
         print(f"\n--- DPO ({n_epochs} epoch(s), {n_batches} mini-batches/epoch, "
               f"grad_accum={grad_accum}, eff_bs={eff_bs}, n_gpu={n_proc}) ---")
+        if self.eval_every > 0:
+            print(f"  eval_every={self.eval_every} steps, "
+                  f"eval_batches={self.eval_batches if self.eval_batches else 'all'} "
+                  f"({len(eval_batches_list)} available)")
 
         resume_step, loss_history = self._try_resume("dpo")
         if resume_step > 0:
             print(f"  Resuming DPO from optimizer step {resume_step + 1}")
+
+        # ── Run initial eval (step 0) before any training ────────────
+        if self.eval_every > 0 and resume_step == 0 and eval_batches_list:
+            self._run_eval(
+                eval_batches_list=eval_batches_list,
+                ref_eval_logps=ref_eval_logps,
+                beta=beta,
+                global_step=0,
+                wandb_enabled=self.config.wandb.enabled,
+            )
 
         self.policy.train()
         global_step = 1
@@ -578,7 +759,7 @@ class ZOTrainerBase:
             for window_start in tqdm.tqdm(
                 range(0, len(indices), grad_accum),
                 desc=f"DPO (Epoch {epoch + 1})",
-                disable=(rank != 0),   # only rank 0 shows the bar
+                disable=(rank != 0),
             ):
                 if global_step <= resume_step:
                     global_step += 1
@@ -587,7 +768,6 @@ class ZOTrainerBase:
                 window = indices[window_start : window_start + grad_accum]
 
                 # ── basis collection (AGZO only, from first batch in window) ──
-                # Each rank uses the same first batch so the basis is identical.
                 first_batch = epoch_batches[window[0]]
                 first_ref_c, first_ref_r = ref_logps[window[0]]
                 first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
@@ -596,16 +776,23 @@ class ZOTrainerBase:
                 self._collect_dpo_basis(first_gpu)
 
                 # ── DDP gradient accumulation ─────────────────────────────────
-                # The window of grad_accum mini-batches is split across ranks.
-                # rank r processes window[r], window[r + n_proc], window[r + 2*n_proc], ...
-                # Each rank accumulates its own local g_hat, then we all_reduce.
                 self._reset_seed()
                 local_g_hat = 0.0
                 local_loss  = 0.0
                 local_count = 0
 
+                # ── per-sample DPO metrics for train logging ──────────────────
+                local_reward_chosen_sum   = torch.tensor(0.0, device=self.accelerator.device)
+                local_reward_rejected_sum = torch.tensor(0.0, device=self.accelerator.device)
+                local_margin_sum          = torch.tensor(0.0, device=self.accelerator.device)
+                local_accuracy_sum        = torch.tensor(0.0, device=self.accelerator.device)
+                local_logps_chosen_sum    = torch.tensor(0.0, device=self.accelerator.device)
+                local_logps_rejected_sum  = torch.tensor(0.0, device=self.accelerator.device)
+                local_logits_chosen_sum   = torch.tensor(0.0, device=self.accelerator.device)
+                local_logits_rejected_sum = torch.tensor(0.0, device=self.accelerator.device)
+                local_sample_count        = torch.tensor(0.0, device=self.accelerator.device)
+
                 for sub_idx, idx in enumerate(window):
-                    # Assign mini-batch sub_idx to rank (sub_idx % n_proc)
                     if sub_idx % n_proc != rank:
                         continue
 
@@ -621,24 +808,83 @@ class ZOTrainerBase:
                     local_loss  += (loss_p + loss_m) / 2
                     local_count += 1
 
-                # ── all_reduce: sum g_hat and loss across ranks, then average ──
+                    # ── compute train reward metrics for this sub-batch ───────
+                    # (reuse the clean policy at θ₀ — no perturbation active)
+                    with torch.no_grad():
+                        B    = gpu_batch['chosen_input_ids'].shape[0]
+                        ids  = torch.cat([gpu_batch['chosen_input_ids'],
+                                          gpu_batch['rejected_input_ids']], dim=0)
+                        mask = torch.cat([gpu_batch['chosen_attention_mask'],
+                                          gpu_batch['rejected_attention_mask']], dim=0)
+                        logits_all = self.policy(ids, attention_mask=mask).logits
+
+                        lc_mean = logits_all[:B].float().mean()
+                        lr_mean = logits_all[B:].float().mean()
+                        local_logits_chosen_sum   += lc_mean * B
+                        local_logits_rejected_sum += lr_mean * B
+
+                        pi_c_lp = get_batch_logps(logits_all[:B], gpu_batch['chosen_labels'],
+                                                  self.compute_logps_fp32)
+                        pi_r_lp = get_batch_logps(logits_all[B:], gpu_batch['rejected_labels'],
+                                                  self.compute_logps_fp32)
+                        rc = beta * (pi_c_lp - gpu_batch['ref_chosen_logps'])
+                        rr = beta * (pi_r_lp - gpu_batch['ref_rejected_logps'])
+                        margins_t  = rc - rr
+                        acc_t      = (margins_t > 0).float()
+
+                    local_reward_chosen_sum   += rc.sum()
+                    local_reward_rejected_sum += rr.sum()
+                    local_margin_sum          += margins_t.sum()
+                    local_accuracy_sum        += acc_t.sum()
+                    local_logps_chosen_sum    += pi_c_lp.sum()
+                    local_logps_rejected_sum  += pi_r_lp.sum()
+                    local_sample_count        += float(B)
+
+                # ── all_reduce: g_hat, loss, reward stats ────────────────────
                 if n_proc > 1:
-                    # Pack into a single tensor for one communication round
-                    stats = torch.tensor(
-                        [local_g_hat, local_loss, float(local_count)],
-                        dtype=torch.float64,
-                        device=self.accelerator.device,
+                    # Pack everything into one tensor for a single round-trip
+                    stats_vec = torch.tensor(
+                        [
+                            local_g_hat, local_loss, float(local_count),
+                        ],
+                        dtype=torch.float64, device=self.accelerator.device,
                     )
-                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                    total_g_hat = stats[0].item()
-                    total_loss  = stats[1].item()
-                    total_count = int(stats[2].item())
+                    dist.all_reduce(stats_vec, op=dist.ReduceOp.SUM)
+                    total_g_hat = stats_vec[0].item()
+                    total_loss  = stats_vec[1].item()
+                    total_count = int(stats_vec[2].item())
+
+                    reward_vec = torch.stack([
+                        local_reward_chosen_sum, local_reward_rejected_sum,
+                        local_margin_sum, local_accuracy_sum,
+                        local_logps_chosen_sum, local_logps_rejected_sum,
+                        local_logits_chosen_sum, local_logits_rejected_sum,
+                        local_sample_count,
+                    ])
+                    dist.all_reduce(reward_vec, op=dist.ReduceOp.SUM)
+                    n_samples = max(reward_vec[6].item(), 1.0)
+                    train_metrics = {
+                        "train/rewards/chosen":    (reward_vec[0] / n_samples).item(),
+                        "train/rewards/rejected":  (reward_vec[1] / n_samples).item(),
+                        "train/rewards/margins":   (reward_vec[2] / n_samples).item(),
+                        "train/rewards/accuracies":(reward_vec[3] / n_samples).item(),
+                        "train/logps/chosen":      (reward_vec[4] / n_samples).item(),
+                        "train/logps/rejected":    (reward_vec[5] / n_samples).item(),
+                    }
                 else:
                     total_g_hat = local_g_hat
                     total_loss  = local_loss
                     total_count = local_count
+                    n_samples   = max(local_sample_count.item(), 1.0)
+                    train_metrics = {
+                        "train/rewards/chosen":    (local_reward_chosen_sum   / n_samples).item(),
+                        "train/rewards/rejected":  (local_reward_rejected_sum / n_samples).item(),
+                        "train/rewards/margins":   (local_margin_sum          / n_samples).item(),
+                        "train/rewards/accuracies":(local_accuracy_sum        / n_samples).item(),
+                        "train/logps/chosen":      (local_logps_chosen_sum    / n_samples).item(),
+                        "train/logps/rejected":    (local_logps_rejected_sum  / n_samples).item(),
+                    }
 
-                # Average over all mini-batches in window (equiv to len(window))
                 g_hat    = total_g_hat / max(total_count, 1)
                 avg_loss = total_loss  / max(total_count, 1)
 
@@ -649,29 +895,44 @@ class ZOTrainerBase:
                 loss_history.append(avg_loss)
 
                 if self.accelerator.is_main_process:
-                    print(f"DPO step {global_step} (e{epoch+1}) | "
-                          f"loss={avg_loss:.4f} | eff_bs={len(window)*self.config.batch_size}")
+                    # 计算小数 epoch (已过去的 batch 数量 / 总 batch 数量)
+                    fractional_epoch = epoch + (window_start / len(indices))
+                    
                     log_dict = {
-                        "train/dpo_loss":        avg_loss,
-                        "train/loss_minus_log2": avg_loss - math.log(2),
-                        "train/g_hat":           total_g_hat / max(total_count, 1),
-                        "step":                  global_step,
-                        "epoch":                 epoch + 1,
-                        "hparams/lr":            self.lr,
-                        "hparams/eps":           self.eps,
-                        "hparams/beta":          beta,
-                        "hparams/eff_bs":        len(window) * self.config.batch_size,
+                        "train/loss":                 avg_loss, # TRL 名字是 train/loss
+                        "train/learning_rate":        self.lr,  # TRL 名字
+                        "train/epoch":                fractional_epoch, # TRL 名字
+                        "train/global_step":          global_step, # TRL 名字
+                        "train/grad_norm":            abs(g_hat),
+                        "train/g_hat":                total_g_hat / max(total_count, 1), # 保留你的特有指标
+                        "hparams/eps":                self.eps,
+                        "hparams/beta":               beta,
+                        **train_metrics,
                     }
                     if getattr(self, "_last_margin", None) is not None:
                         log_dict["train/margin"] = self._last_margin
-                    wandb.log(log_dict)
+                    if self.config.wandb.enabled:
+                        wandb.log(log_dict)
 
                 if avg_loss > self.max_loss_threshold:
                     if self.accelerator.is_main_process:
-                        print(f"\n[Warning] DPO loss ({avg_loss:.4f}) exceeded the threshold {self.max_loss_threshold} "
-                              f"(occurred at step {global_step})。Model has diverged, terminating training...")
+                        print(f"\n[Warning] DPO loss ({avg_loss:.4f}) exceeded the threshold "
+                              f"{self.max_loss_threshold} (occurred at step {global_step}). "
+                              f"Model has diverged, terminating training...")
                     stop_training = True
                     break
+
+                # ── eval ─────────────────────────────────────────────────────
+                if (self.eval_every > 0
+                        and eval_batches_list
+                        and global_step % self.eval_every == 0):
+                    self._run_eval(
+                        eval_batches_list=eval_batches_list,
+                        ref_eval_logps=ref_eval_logps,
+                        beta=beta,
+                        global_step=global_step,
+                        wandb_enabled=self.config.wandb.enabled,
+                    )
 
                 if global_step % self.checkpoint_every == 0:
                     self._save_checkpoint("dpo", global_step, loss_history)
@@ -682,16 +943,138 @@ class ZOTrainerBase:
             if self.accelerator.is_main_process:
                 print("  [Info] Skipping final model save due to divergence.")
                 
-            # delete checkpoint dir to save space
             if os.path.exists(self.ckpt_dir):
                 try:
                     shutil.rmtree(self.ckpt_dir)
                     print(f"  [cleanup] Successfully deleted checkpoint directory --> {self.ckpt_dir}")
                 except Exception as e:
                     print(f"  [cleanup] WARNING: Failed to delete checkpoint directory {self.ckpt_dir}. Error: {e}")
-
         else:
+            # ── final eval before saving ──────────────────────────────
+            if self.eval_every > 0 and eval_batches_list:
+                self._run_eval(
+                    eval_batches_list=eval_batches_list,
+                    ref_eval_logps=ref_eval_logps,
+                    beta=beta,
+                    global_step=global_step - 1,
+                    wandb_enabled=self.config.wandb.enabled,
+                )
             self.save_final("dpo")
+
+    # ================================================================
+    # Eval data preparation
+    # ================================================================
+
+    def _prepare_eval_data(
+        self,
+        ref_path: str,
+        beta: float,
+        n_examples: Optional[int],
+    ) -> Tuple[List[dict], List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Build eval batches + ref logps (cached to disk), identical pattern
+        to the train ref-logps cache.
+
+        Returns:
+          eval_batches_list : list of CPU batch dicts (no ref keys)
+          ref_eval_logps    : parallel list of (ref_chosen_logps, ref_rejected_logps)
+                              tensors on CPU
+        """
+        sft_stage_dir = os.path.dirname(os.path.normpath(ref_path))
+        fp32_suffix   = "_fp32" if self.compute_logps_fp32 else ""
+        eval_cache_file = os.path.join(
+            sft_stage_dir,
+            f"ref_eval_logps_bs{self.config.batch_size}_bfloat16{fp32_suffix}.pt"
+        )
+
+        if os.path.exists(eval_cache_file):
+            print(f"\n--- [Eval Cache Hit] Loading eval ref logps from {eval_cache_file} ---")
+            payload = torch.load(eval_cache_file, map_location="cpu", weights_only=False)
+            eval_batches_list = payload["batches"]
+            ref_eval_logps    = payload["ref_logps"]
+            return eval_batches_list, ref_eval_logps
+
+        print(f"\n--- [Eval Cache Miss] Computing eval ref logps (one-time cost) ---")
+
+        # Each rank loads the ref model on its own GPU
+        ref_model = transformers.AutoModelForCausalLM.from_pretrained(
+            ref_path,
+            cache_dir=self.hf_model_cache,
+            torch_dtype=torch.bfloat16,
+            device_map=self.accelerator.device,
+        )
+        ref_model.eval()
+        disable_dropout(ref_model)
+
+        # Load ALL eval batches on every rank (needed for later indexing)
+        all_eval_batches = list(tqdm.tqdm(
+            get_chat_template_iterator(
+                tokenizer=self.tokenizer,
+                split='test',
+                batch_size=self.config.batch_size,
+                n_epochs=1,
+                n_examples=n_examples,
+                max_length=self.config.max_length,
+                max_prompt_length=self.config.max_prompt_length,
+                shuffle=False,
+                cache_dir=self.dataset_cache_dir,
+            ),
+            desc="Loading eval dataset",
+            disable=(self.accelerator.process_index != 0),
+        ))
+
+        n_proc_ref = self.accelerator.num_processes
+        rank_ref   = self.accelerator.process_index
+
+        local_results: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm.tqdm(
+                all_eval_batches,
+                desc=f"Eval ref logps (rank {rank_ref})",
+                disable=(rank_ref != 0),
+            )):
+                if i % n_proc_ref != rank_ref:
+                    continue
+                gb = {k: batch[k].to(self.accelerator.device)
+                      for k in ['chosen_input_ids',   'chosen_attention_mask',   'chosen_labels',
+                                'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels']}
+                B   = gb['chosen_input_ids'].shape[0]
+                ids = torch.cat([gb['chosen_input_ids'],      gb['rejected_input_ids']],      dim=0)
+                msk = torch.cat([gb['chosen_attention_mask'], gb['rejected_attention_mask']], dim=0)
+                all_logits = ref_model(ids, attention_mask=msk).logits
+                local_results[i] = (
+                    get_batch_logps(all_logits[:B], gb['chosen_labels'], self.compute_logps_fp32).cpu(),
+                    get_batch_logps(all_logits[B:], gb['rejected_labels'], self.compute_logps_fp32).cpu(),
+                )
+
+        # Gather from all ranks
+        if n_proc_ref > 1:
+            gathered = [None] * n_proc_ref
+            dist.all_gather_object(gathered, local_results)
+            merged: Dict[int, Tuple] = {}
+            for d in gathered:
+                merged.update(d)
+            ref_eval_logps_ordered = [merged[i] for i in sorted(merged.keys())]
+        else:
+            ref_eval_logps_ordered = [local_results[i] for i in sorted(local_results.keys())]
+
+        # Rank 0 saves; everyone waits
+        if self.accelerator.is_main_process:
+            payload = {
+                "batches":   all_eval_batches,
+                "ref_logps": ref_eval_logps_ordered,
+            }
+            tmp = f"{eval_cache_file}.tmp.{os.getpid()}"
+            torch.save(payload, tmp)
+            os.replace(tmp, eval_cache_file)
+            print(f"  [Eval Cache Saved] {len(all_eval_batches)} batches -> {eval_cache_file}")
+
+        self.accelerator.wait_for_everyone()
+        del ref_model
+        torch.cuda.empty_cache()
+
+        return all_eval_batches, ref_eval_logps_ordered
 
     # ================================================================
     # Checkpoint helpers
@@ -805,7 +1188,6 @@ class ZOTrainerBase:
 
         print(f"  [final] Model saved --> {out_dir}")
 
-        # delete checkpoint dir to save space
         if os.path.exists(self.ckpt_dir):
             try:
                 shutil.rmtree(self.ckpt_dir)
@@ -1013,9 +1395,9 @@ class AGZOTrainer(ZOTrainerBase):
             (n, p) for n, p in policy.named_parameters() if p.requires_grad
         ]
         # --- [NEW] LOZO-M 动量配置 ---
-        self.momentum_beta = float(tcfg.get("momentum_beta", 0.9)) # 动量衰减系数
-        self.momentum_buffer: Dict[str, torch.Tensor] = {}         # 存储子空间动量 N
-        self.prev_basis: Dict[str, torch.Tensor] = {}              # 存储上一步的 Basis
+        self.momentum_beta = float(tcfg.get("momentum_beta", 0.9))
+        self.momentum_buffer: Dict[str, torch.Tensor] = {}
+        self.prev_basis: Dict[str, torch.Tensor] = {}
 
     def _project_momentum(self):
         """将旧子空间的动量投影到新激活子空间中 (实现 LOZO Eq. 21)"""
@@ -1035,10 +1417,7 @@ class AGZOTrainer(ZOTrainerBase):
             new_basis = new_basis.to(device=self.momentum_buffer[name].device)
             old_basis = old_basis.to(device=self.momentum_buffer[name].device)
             
-            # old_basis: [rank, d_in], new_basis: [rank, d_in]
-            # 计算转换矩阵: old_basis @ new_basis.T  -> shape [rank, rank]
             transition = torch.matmul(old_basis, new_basis.T)
-            # 更新投影后的动量: N_tilde = N_old @ transition
             self.momentum_buffer[name] = torch.matmul(self.momentum_buffer[name], transition)
 
     def _sft_step(self, gpu_batch: dict) -> float:
@@ -1096,7 +1475,6 @@ class AGZOTrainer(ZOTrainerBase):
             - get_batch_logps(logits[B:], gpu_batch['rejected_labels'], self.compute_logps_fp32)
         ).mean().item()
 
-        # --- [NEW] 投影动量并备份新的子空间基底 ---
         self._project_momentum()
         self.prev_basis = {k: v.clone() for k, v in self._engine.basis.items()}
 
@@ -1114,9 +1492,7 @@ class AGZOTrainer(ZOTrainerBase):
         for name, param in self._params:
             basis = self._engine.basis.get(name)
             
-            # 1. 拦截不适用子空间的参数 (1D Bias/Norm等)，回退到普通全空间动量
             if basis is None or param.dim() < 2 or basis.shape[1] != param.shape[1]:
-                # 必须消耗掉同等数量的随机数，保证后续参数的 RNG 对齐！
                 z = torch.randn_like(param.data)  
                 grad_est = projected_grad * z
                 
@@ -1127,10 +1503,8 @@ class AGZOTrainer(ZOTrainerBase):
                 param.data.add_(self.momentum_buffer[name], alpha= - self.lr)
                 continue
                 
-            # 2. LOZO-M 子空间动量累加核心逻辑 (实现 LOZO Eq. 20)
             basis = basis.to(device=param.device, dtype=param.dtype)
             
-            # 重新生成扰动因子 R，严格对齐 _engine.sample_z 的随机数序列
             r_vec = torch.randn(param.shape[0], basis.shape[0], device=param.device, dtype=param.dtype)
             r_vec_eff = r_vec / math.sqrt(basis.shape[0])
             
@@ -1139,10 +1513,8 @@ class AGZOTrainer(ZOTrainerBase):
             if name not in self.momentum_buffer:
                 self.momentum_buffer[name] = torch.zeros_like(r_vec_eff)
                 
-            # 累加子空间动量 N^t = beta * N^{t-1} + (1-beta) * c^t U^t
             self.momentum_buffer[name] = beta * self.momentum_buffer[name] + (1 - beta) * current_grad_signal
             
-            # 映射回全空间进行参数更新: Delta W = N @ Basis
             update_direction = torch.matmul(self.momentum_buffer[name], basis)
             param.data.add_(update_direction, alpha= - self.lr)
 
@@ -1167,7 +1539,6 @@ class AGZOPlainTrainer(AGZOTrainer):
             - get_batch_logps(logits[B:], gpu_batch['rejected_labels'], self.compute_logps_fp32)
         ).mean().item()
 
-        # --- [NEW] 投影动量并备份新的子空间基底 ---
         self._project_momentum()
         self.prev_basis = {k: v.clone() for k, v in self._engine.basis.items()}
 

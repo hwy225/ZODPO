@@ -88,7 +88,6 @@ def main(config: DictConfig):
             config=OmegaConf.to_container(config, resolve=True),
             name=config.exp_name,
             dir="/tmp/wandb_tmp",
-            settings=wandb.Settings(_disable_stats=True, _disable_meta=True),
         )
         if resumed_run_id is not None:
             init_kw["id"]     = resumed_run_id

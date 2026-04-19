@@ -43,7 +43,13 @@ for config in "${CONFIGS[@]}"; do
     gc_tag=$(echo "$gc")
     rank_tag=$(echo "$rank")
 
-    EXP_NAME="dpo_bf16_${TRAINER}_momentum_bs${bs_tag}_gc${gc_tag}_lr${lr_tag}_eps${eps_tag}_${mbeta_tag}_rank${rank_tag}_$(date +%Y%m%d)"
+    if [[ "${TRAINER}" == "agzo" || "${TRAINER}" == "agzo_plain" ]]; then
+        trainer_tag="_mb${mbeta_tag}_r${rank_tag}"
+    else
+        trainer_tag=""
+    fi
+    
+    EXP_NAME="dpo_fp32_${TRAINER}_bs${bs_tag}_gc${gc_tag}_lr${lr_tag}_eps${eps_tag}${trainer_tag}_$(date +%Y%m%d)"
 
     echo "Submitting: $EXP_NAME"
 

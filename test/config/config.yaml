@@ -33,6 +33,9 @@ checkpoint_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/checkpoints"
 runs_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/runs"
 checkpoint_every: 50
 
+eval_every: 500      # 每 500 个 optimizer step 做一次 eval（0 = 关闭）
+eval_batches: 200    # 每次 eval 最多用多少个 mini-batch（null = 全部）
+
 # ── Hydra config-group defaults ──────────────────────────────
 defaults:
   - _self_
