@@ -468,8 +468,6 @@ class ZOTrainerBase:
         print(f"\n--- DPO ({n_epochs} epoch(s), {n_batches} mini-batches/epoch, "
               f"grad_accum={grad_accum}, eff_bs={eff_bs}) ---")
 
-        # ── resume ───────────────────────────────────────────────────
-        # global_step counts optimizer steps (one step = grad_accum mini-batches)
         resume_step, loss_history = self._try_resume("dpo")
         if resume_step > 0:
             print(f"  Resuming DPO from optimizer step {resume_step + 1}")
@@ -513,6 +511,7 @@ class ZOTrainerBase:
 
                 window = indices[window_start : window_start + grad_accum]
 
+                # Collect basis once per window (AGZO: uses first mini-batch)
                 first_batch = epoch_batches[window[0]]
                 first_ref_c, first_ref_r = ref_logps[window[0]]
                 first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
@@ -520,9 +519,13 @@ class ZOTrainerBase:
                 first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
                 self._collect_dpo_basis(first_gpu)
 
-                self._reset_seed()
-                accum_g_hat = 0.0
-                accum_loss  = 0.0
+                accum_loss = 0.0
+                # Accumulate parameter updates directly (θ_delta = -lr * g_hat_i * z_i)
+                # by doing a full ZO step per mini-batch but with lr/N so the
+                # total update magnitude is equivalent to one step on a batch of N.
+                scaled_lr = self.lr / len(window)
+                original_lr = self.lr
+                self.lr = scaled_lr
 
                 for idx in window:
                     batch = epoch_batches[idx]
@@ -532,15 +535,18 @@ class ZOTrainerBase:
                     gpu_batch['ref_chosen_logps']  = ref_chosen_logps.to(self.accelerator.device)
                     gpu_batch['ref_rejected_logps'] = ref_rejected_logps.to(self.accelerator.device)
 
+                    self._reset_seed()                           # fresh z for each mini-batch
                     loss_p, loss_m = self._dpo_loss(gpu_batch, beta)
-                    accum_g_hat += (loss_p - loss_m) / (2 * self.eps)
-                    accum_loss  += (loss_p + loss_m) / 2
+                    g_hat = (loss_p - loss_m) / (2 * self.eps)
 
-                g_hat = accum_g_hat / len(window)
-                clip_val = 0.05 / self.eps
-                g_hat = max(min(g_hat, clip_val), -clip_val)
+                    clip_val = 0.05 / self.eps
+                    g_hat = max(min(g_hat, clip_val), -clip_val)
+
+                    self._apply_update(g_hat)                    # θ += -scaled_lr * g_hat * z
+                    accum_loss += (loss_p + loss_m) / 2
+
+                self.lr = original_lr                            # restore lr
                 avg_loss = accum_loss / len(window)
-                self._apply_update(g_hat)
                 loss_history.append(avg_loss)
 
                 if self.accelerator.is_main_process:

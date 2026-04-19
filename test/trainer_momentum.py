@@ -6,6 +6,7 @@ import shutil
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
@@ -150,7 +151,15 @@ class ZOTrainerBase:
 
     def _reset_seed(self):
         """Draw a fresh random seed for this ZO step."""
-        self._zo_seed = int(torch.randint(0, 2**32, (1,)).item())
+        if self.accelerator.is_main_process:
+            seed_tensor = torch.randint(0, 2**32, (1,), device=self.accelerator.device)
+        else:
+            seed_tensor = torch.empty((1,), dtype=torch.int64, device=self.accelerator.device)
+        
+        if self.accelerator.num_processes > 1:
+            dist.broadcast(seed_tensor, src=0)
+            
+        self._zo_seed = int(seed_tensor.item())
 
     # ================================================================
     # Batch helpers
@@ -176,6 +185,9 @@ class ZOTrainerBase:
 
     def _sft_step(self, gpu_batch: dict) -> float:
         self._reset_seed()
+
+        active_params = [p for p in self.policy.parameters() if p.requires_grad]
+        saved_weights = [p.data.clone() for p in active_params]
         with torch.no_grad():
             self._perturb(+1)
             loss_p = compute_sft_loss(
@@ -186,7 +198,11 @@ class ZOTrainerBase:
                 gpu_batch['chosen_labels'],
                 compute_fp32=self.compute_logps_fp32
             )
-            self._perturb(-2)
+
+            for p, saved_w in zip(active_params, saved_weights):
+                p.data.copy_(saved_w)
+
+            self._perturb(-1)
             loss_m = compute_sft_loss(
                 self.policy(
                     gpu_batch['chosen_input_ids'],
@@ -196,7 +212,9 @@ class ZOTrainerBase:
                 compute_fp32=self.compute_logps_fp32
             )
 
-            self._perturb(+1)
+            # self._perturb(+1)
+            for p, saved_w in zip(active_params, saved_weights):
+                p.data.copy_(saved_w)
             
             self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
         return ((loss_p + loss_m) / 2).item()
@@ -204,6 +222,9 @@ class ZOTrainerBase:
     def _dpo_loss(self, gpu_batch: dict, beta: float) -> float:
         B    = gpu_batch['chosen_input_ids'].shape[0]
         ids, mask = self._concat_cr(gpu_batch)
+        active_params = [p for p in self.policy.parameters() if p.requires_grad]
+        saved_weights = [p.data.clone() for p in active_params]
+
         with torch.no_grad():
             self._perturb(+1)
             logits = self.policy(ids, attention_mask=mask).logits
@@ -214,7 +235,12 @@ class ZOTrainerBase:
                 beta,
                 compute_fp32=self.compute_logps_fp32
             )
-            self._perturb(-2)
+
+            for p, saved_w in zip(active_params, saved_weights):
+                p.data.copy_(saved_w)
+
+            self._perturb(-1)
+
             logits = self.policy(ids, attention_mask=mask).logits
             loss_m = compute_dpo_loss(
                 logits[:B], logits[B:],
@@ -223,7 +249,10 @@ class ZOTrainerBase:
                 beta,
                 compute_fp32=self.compute_logps_fp32
             )
-            self._perturb(+1)   # restore to θ₀ after ±ε cycle
+            # self._perturb(+1)   # restore to θ₀ after ±ε cycle
+            for p, saved_w in zip(active_params, saved_weights):
+                p.data.copy_(saved_w)
+
         return loss_p.item(), loss_m.item()
 
     def _collect_dpo_basis(self, gpu_batch: dict):
@@ -410,7 +439,7 @@ class ZOTrainerBase:
         fp32_suffix = "_fp32" if self.compute_logps_fp32 else ""
         cache_file = os.path.join(
             sft_stage_dir,
-            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}_{str(dtype).split('.')[1]}{fp32_suffix}.pt"
+            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}_bfloat16{fp32_suffix}.pt"
         )
 
         if os.path.exists(cache_file):
@@ -420,10 +449,12 @@ class ZOTrainerBase:
             )
         else:
             print(f"\n--- [Cache Miss] Computing ref logps (one-time cost) ---")
+            # Each rank loads the ref model on its own device.
+            # Only rank 0 will write the cache file; others wait at the barrier below.
             ref_model = transformers.AutoModelForCausalLM.from_pretrained(
                 ref_path,
                 cache_dir=self.hf_model_cache,
-                torch_dtype=dtype,
+                torch_dtype=bfloat16,   # ref model always in bfloat16 to save VRAM
                 device_map=self.accelerator.device,
             )
             ref_model.eval()
@@ -442,8 +473,35 @@ class ZOTrainerBase:
             )
 
             ref_logps = []
+            n_proc_ref = self.accelerator.num_processes
+            rank_ref   = self.accelerator.process_index
+
             with torch.no_grad():
-                for batch in tqdm.tqdm(ref_iter, desc="Ref logps"):
+                all_batches = list(tqdm.tqdm(
+                    get_chat_template_iterator(
+                        tokenizer=self.tokenizer,
+                        split='train',
+                        batch_size=self.config.batch_size,
+                        n_epochs=1,
+                        n_examples=n_examples,
+                        max_length=self.config.max_length,
+                        max_prompt_length=self.config.max_prompt_length,
+                        shuffle=False,
+                        cache_dir=self.dataset_cache_dir,
+                    ),
+                    desc="Loading for ref logps",
+                    disable=(rank_ref != 0),
+                ))
+
+                # Each rank computes its slice; we assemble in order afterward.
+                local_results: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+                for i, batch in enumerate(tqdm.tqdm(
+                    all_batches,
+                    desc=f"Ref logps (rank {rank_ref})",
+                    disable=(rank_ref != 0),
+                )):
+                    if i % n_proc_ref != rank_ref:
+                        continue   # another rank handles this batch
                     gb = {k: batch[k].to(self.accelerator.device)
                           for k in ['chosen_input_ids',   'chosen_attention_mask',   'chosen_labels',
                                     'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels']}
@@ -451,38 +509,52 @@ class ZOTrainerBase:
                     ids = torch.cat([gb['chosen_input_ids'],      gb['rejected_input_ids']],      dim=0)
                     msk = torch.cat([gb['chosen_attention_mask'], gb['rejected_attention_mask']], dim=0)
                     all_logits = ref_model(ids, attention_mask=msk).logits
-                    ref_logps.append((
+                    local_results[i] = (
                         get_batch_logps(all_logits[:B], gb['chosen_labels'], self.compute_logps_fp32).cpu(),
                         get_batch_logps(all_logits[B:], gb['rejected_labels'], self.compute_logps_fp32).cpu(),
-                    ))
+                    )
 
-            tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}"
-            torch.save(ref_logps, tmp_cache_file)
-            os.replace(tmp_cache_file, cache_file)
-            
-            print(f"  [Cache Saved] {len(ref_logps)} mini-batches -> {cache_file}")
+            # Gather results from all ranks onto rank 0 and assemble in order
+            if n_proc_ref > 1:
+                gathered = [None] * n_proc_ref
+                dist.all_gather_object(gathered, local_results)
+                merged: Dict[int, Tuple] = {}
+                for d in gathered:
+                    merged.update(d)
+                ref_logps = [merged[i] for i in sorted(merged.keys())]
+            else:
+                ref_logps = [local_results[i] for i in sorted(local_results.keys())]
+
+            # Only rank 0 writes the cache (atomic write)
+            if self.accelerator.is_main_process:
+                tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}"
+                torch.save(ref_logps, tmp_cache_file)
+                os.replace(tmp_cache_file, cache_file)
+                print(f"  [Cache Saved] {len(ref_logps)} mini-batches -> {cache_file}")
+
+            # All ranks must wait before proceeding (so they all load from the same cache)
+            self.accelerator.wait_for_everyone()
             del ref_model
             torch.cuda.empty_cache()
 
         n_batches = len(ref_logps)
+        n_proc    = self.accelerator.num_processes
+        rank      = self.accelerator.process_index
         print(f"\n--- DPO ({n_epochs} epoch(s), {n_batches} mini-batches/epoch, "
-              f"grad_accum={grad_accum}, eff_bs={eff_bs}) ---")
+              f"grad_accum={grad_accum}, eff_bs={eff_bs}, n_gpu={n_proc}) ---")
 
-        # ── resume ───────────────────────────────────────────────────
-        # global_step counts optimizer steps (one step = grad_accum mini-batches)
         resume_step, loss_history = self._try_resume("dpo")
         if resume_step > 0:
             print(f"  Resuming DPO from optimizer step {resume_step + 1}")
 
         self.policy.train()
-        global_step = 1         
-        
+        global_step = 1
         stop_training = False
 
         for epoch in range(n_epochs):
             if stop_training:
                 break
-                
+
             print(f"\nEpoch {epoch + 1}/{n_epochs}")
 
             indices = list(range(n_batches))
@@ -505,7 +577,8 @@ class ZOTrainerBase:
 
             for window_start in tqdm.tqdm(
                 range(0, len(indices), grad_accum),
-                desc=f"DPO (Epoch {epoch + 1})"
+                desc=f"DPO (Epoch {epoch + 1})",
+                disable=(rank != 0),   # only rank 0 shows the bar
             ):
                 if global_step <= resume_step:
                     global_step += 1
@@ -513,6 +586,8 @@ class ZOTrainerBase:
 
                 window = indices[window_start : window_start + grad_accum]
 
+                # ── basis collection (AGZO only, from first batch in window) ──
+                # Each rank uses the same first batch so the basis is identical.
                 first_batch = epoch_batches[window[0]]
                 first_ref_c, first_ref_r = ref_logps[window[0]]
                 first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
@@ -520,11 +595,20 @@ class ZOTrainerBase:
                 first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
                 self._collect_dpo_basis(first_gpu)
 
+                # ── DDP gradient accumulation ─────────────────────────────────
+                # The window of grad_accum mini-batches is split across ranks.
+                # rank r processes window[r], window[r + n_proc], window[r + 2*n_proc], ...
+                # Each rank accumulates its own local g_hat, then we all_reduce.
                 self._reset_seed()
-                accum_g_hat = 0.0
-                accum_loss  = 0.0
+                local_g_hat = 0.0
+                local_loss  = 0.0
+                local_count = 0
 
-                for idx in window:
+                for sub_idx, idx in enumerate(window):
+                    # Assign mini-batch sub_idx to rank (sub_idx % n_proc)
+                    if sub_idx % n_proc != rank:
+                        continue
+
                     batch = epoch_batches[idx]
                     ref_chosen_logps, ref_rejected_logps = ref_logps[idx]
 
@@ -533,13 +617,34 @@ class ZOTrainerBase:
                     gpu_batch['ref_rejected_logps'] = ref_rejected_logps.to(self.accelerator.device)
 
                     loss_p, loss_m = self._dpo_loss(gpu_batch, beta)
-                    accum_g_hat += (loss_p - loss_m) / (2 * self.eps)
-                    accum_loss  += (loss_p + loss_m) / 2
+                    local_g_hat += (loss_p - loss_m) / (2 * self.eps)
+                    local_loss  += (loss_p + loss_m) / 2
+                    local_count += 1
 
-                g_hat = accum_g_hat / len(window)
+                # ── all_reduce: sum g_hat and loss across ranks, then average ──
+                if n_proc > 1:
+                    # Pack into a single tensor for one communication round
+                    stats = torch.tensor(
+                        [local_g_hat, local_loss, float(local_count)],
+                        dtype=torch.float64,
+                        device=self.accelerator.device,
+                    )
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                    total_g_hat = stats[0].item()
+                    total_loss  = stats[1].item()
+                    total_count = int(stats[2].item())
+                else:
+                    total_g_hat = local_g_hat
+                    total_loss  = local_loss
+                    total_count = local_count
+
+                # Average over all mini-batches in window (equiv to len(window))
+                g_hat    = total_g_hat / max(total_count, 1)
+                avg_loss = total_loss  / max(total_count, 1)
+
                 clip_val = 0.05 / self.eps
                 g_hat = max(min(g_hat, clip_val), -clip_val)
-                avg_loss = accum_loss / len(window)
+
                 self._apply_update(g_hat)
                 loss_history.append(avg_loss)
 
@@ -549,6 +654,7 @@ class ZOTrainerBase:
                     log_dict = {
                         "train/dpo_loss":        avg_loss,
                         "train/loss_minus_log2": avg_loss - math.log(2),
+                        "train/g_hat":           total_g_hat / max(total_count, 1),
                         "step":                  global_step,
                         "epoch":                 epoch + 1,
                         "hparams/lr":            self.lr,
@@ -575,7 +681,7 @@ class ZOTrainerBase:
         if stop_training:
             if self.accelerator.is_main_process:
                 print("  [Info] Skipping final model save due to divergence.")
-
+                
             # delete checkpoint dir to save space
             if os.path.exists(self.ckpt_dir):
                 try:
@@ -828,6 +934,10 @@ class AGZOEngine:
     def _power_iter(A: torch.Tensor, steps: int, r: int) -> Optional[torch.Tensor]:
         d = A.shape[1]
         r = max(1, min(r, d))
+
+        gen = torch.Generator(device=A.device)
+        gen.manual_seed(1337)
+
         q = torch.randn(d, r, device=A.device, dtype=A.dtype)
         q, _ = torch.linalg.qr(q, mode="reduced")
         for _ in range(max(1, steps)):
@@ -902,6 +1012,34 @@ class AGZOTrainer(ZOTrainerBase):
         self._params: List[Tuple[str, nn.Parameter]] = [
             (n, p) for n, p in policy.named_parameters() if p.requires_grad
         ]
+        # --- [NEW] LOZO-M 动量配置 ---
+        self.momentum_beta = float(tcfg.get("momentum_beta", 0.9)) # 动量衰减系数
+        self.momentum_buffer: Dict[str, torch.Tensor] = {}         # 存储子空间动量 N
+        self.prev_basis: Dict[str, torch.Tensor] = {}              # 存储上一步的 Basis
+
+    def _project_momentum(self):
+        """将旧子空间的动量投影到新激活子空间中 (实现 LOZO Eq. 21)"""
+        if not self.momentum_buffer:
+            return
+            
+        for name, _ in self._params:
+            if name not in self.momentum_buffer:
+                continue
+                
+            new_basis = self._engine.basis.get(name)
+            old_basis = self.prev_basis.get(name)
+            
+            if new_basis is None or old_basis is None:
+                continue
+                
+            new_basis = new_basis.to(device=self.momentum_buffer[name].device)
+            old_basis = old_basis.to(device=self.momentum_buffer[name].device)
+            
+            # old_basis: [rank, d_in], new_basis: [rank, d_in]
+            # 计算转换矩阵: old_basis @ new_basis.T  -> shape [rank, rank]
+            transition = torch.matmul(old_basis, new_basis.T)
+            # 更新投影后的动量: N_tilde = N_old @ transition
+            self.momentum_buffer[name] = torch.matmul(self.momentum_buffer[name], transition)
 
     def _sft_step(self, gpu_batch: dict) -> float:
         self._reset_seed()
@@ -912,6 +1050,9 @@ class AGZOTrainer(ZOTrainerBase):
                 attention_mask=gpu_batch['chosen_attention_mask'],
             )
         )
+        active_params = [p for p in self.policy.parameters() if p.requires_grad]
+        saved_weights = [p.data.clone() for p in active_params]
+
         with torch.no_grad():
             self._perturb(+1)
             loss_p = compute_sft_loss(
@@ -922,7 +1063,11 @@ class AGZOTrainer(ZOTrainerBase):
                 gpu_batch['chosen_labels'],
                 compute_fp32=self.compute_logps_fp32
             )
-            self._perturb(-2)
+
+            for p, saved_w in zip(active_params, saved_weights):
+                p.data.copy_(saved_w)
+
+            self._perturb(-1)
             loss_m = compute_sft_loss(
                 self.policy(
                     gpu_batch['chosen_input_ids'],
@@ -931,6 +1076,10 @@ class AGZOTrainer(ZOTrainerBase):
                 gpu_batch['chosen_labels'],
                 compute_fp32=self.compute_logps_fp32
             )
+
+            for p, saved_w in zip(active_params, saved_weights):
+                p.data.copy_(saved_w)
+
             self._apply_update(((loss_p - loss_m) / (2 * self.eps)).item())
         return ((loss_p + loss_m) / 2).item()
 
@@ -947,6 +1096,10 @@ class AGZOTrainer(ZOTrainerBase):
             - get_batch_logps(logits[B:], gpu_batch['rejected_labels'], self.compute_logps_fp32)
         ).mean().item()
 
+        # --- [NEW] 投影动量并备份新的子空间基底 ---
+        self._project_momentum()
+        self.prev_basis = {k: v.clone() for k, v in self._engine.basis.items()}
+
     def _perturb(self, scaling: float):
         torch.manual_seed(self._zo_seed)
         for name, param in self._params:
@@ -954,10 +1107,44 @@ class AGZOTrainer(ZOTrainerBase):
             param.data.add_(z, alpha=scaling * self.eps)
 
     def _apply_update(self, projected_grad: float):
+        """应用带有 LOZO-M 子空间动量的更新"""
         torch.manual_seed(self._zo_seed)
+        beta = self.momentum_beta
+        
         for name, param in self._params:
-            z = self._engine.sample_z(name, param)
-            param.data.add_(z, alpha= - self.lr * projected_grad)
+            basis = self._engine.basis.get(name)
+            
+            # 1. 拦截不适用子空间的参数 (1D Bias/Norm等)，回退到普通全空间动量
+            if basis is None or param.dim() < 2 or basis.shape[1] != param.shape[1]:
+                # 必须消耗掉同等数量的随机数，保证后续参数的 RNG 对齐！
+                z = torch.randn_like(param.data)  
+                grad_est = projected_grad * z
+                
+                if name not in self.momentum_buffer:
+                    self.momentum_buffer[name] = torch.zeros_like(param.data)
+                    
+                self.momentum_buffer[name] = beta * self.momentum_buffer[name] + (1 - beta) * grad_est
+                param.data.add_(self.momentum_buffer[name], alpha= - self.lr)
+                continue
+                
+            # 2. LOZO-M 子空间动量累加核心逻辑 (实现 LOZO Eq. 20)
+            basis = basis.to(device=param.device, dtype=param.dtype)
+            
+            # 重新生成扰动因子 R，严格对齐 _engine.sample_z 的随机数序列
+            r_vec = torch.randn(param.shape[0], basis.shape[0], device=param.device, dtype=param.dtype)
+            r_vec_eff = r_vec / math.sqrt(basis.shape[0])
+            
+            current_grad_signal = projected_grad * r_vec_eff
+            
+            if name not in self.momentum_buffer:
+                self.momentum_buffer[name] = torch.zeros_like(r_vec_eff)
+                
+            # 累加子空间动量 N^t = beta * N^{t-1} + (1-beta) * c^t U^t
+            self.momentum_buffer[name] = beta * self.momentum_buffer[name] + (1 - beta) * current_grad_signal
+            
+            # 映射回全空间进行参数更新: Delta W = N @ Basis
+            update_direction = torch.matmul(self.momentum_buffer[name], basis)
+            param.data.add_(update_direction, alpha= - self.lr)
 
     def cleanup(self):
         self._engine.remove_hooks()
@@ -979,6 +1166,10 @@ class AGZOPlainTrainer(AGZOTrainer):
             get_batch_logps(logits[:B], gpu_batch['chosen_labels'], self.compute_logps_fp32)
             - get_batch_logps(logits[B:], gpu_batch['rejected_labels'], self.compute_logps_fp32)
         ).mean().item()
+
+        # --- [NEW] 投影动量并备份新的子空间基底 ---
+        self._project_momentum()
+        self.prev_basis = {k: v.clone() for k, v in self._engine.basis.items()}
 
 
 # ============================================================

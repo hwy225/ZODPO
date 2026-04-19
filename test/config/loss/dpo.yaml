@@ -10,3 +10,5 @@ beta: 0.1
 # MUST be set when running the DPO stage, e.g.:
 #   python train.py loss=dpo loss.sft_model_path=outputs/my_sft/final_model ...
 sft_model_path: ???
+
+num_epochs: null
