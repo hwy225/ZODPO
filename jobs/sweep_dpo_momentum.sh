@@ -14,7 +14,8 @@ SFT_EXP="${2:?Usage: bash sweep_momentum.sh <trainer> <sft_exp_name>}"
 # Each row: "lr eps dpo_beta bs gc m_beta rank"
 CONFIGS=(
     # 推荐的搜索网格 (在确保是 fp32 的前提下，可以尝试较大的 lr)
-    "1e-6  1e-4  0.1  4  16  0.9   1"
+    # "1e-6  1e-3  0.1  4  16  0.9   1"
+    "1e-6  1e-4  0.1  16  4  0.9   1"
     # "1e-6  1e-4  0.1  4  16  0.95  1"
     # "1e-6  1e-4  0.1  4  16  0.99  1"
 )
@@ -42,14 +43,8 @@ for config in "${CONFIGS[@]}"; do
     bs_tag=$(echo "$bs")
     gc_tag=$(echo "$gc")
     rank_tag=$(echo "$rank")
-
-    if [[ "${TRAINER}" == "agzo" || "${TRAINER}" == "agzo_plain" ]]; then
-        trainer_tag="_mb${mbeta_tag}_r${rank_tag}"
-    else
-        trainer_tag=""
-    fi
     
-    EXP_NAME="dpo_fp32_${TRAINER}_bs${bs_tag}_gc${gc_tag}_lr${lr_tag}_eps${eps_tag}${trainer_tag}_$(date +%Y%m%d)"
+    EXP_NAME="dpo_bf16_${TRAINER}_bs${bs_tag}_gc${gc_tag}_lr${lr_tag}_eps${eps_tag}_mbeta${mbeta_tag}_$(date +%Y%m%d)"
 
     echo "Submitting: $EXP_NAME"
 

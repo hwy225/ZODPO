@@ -271,6 +271,59 @@ class ZOTrainerBase:
         return ids, mask
 
     # ================================================================
+    # Momentum initialization helper
+    # ================================================================
+
+    def _init_momentum_from_sft(self, base_model_path: str, alpha: float):
+        """
+        Load the SFT model (pi_0) from `base_model_path`, compute the difference to current policy (pi_sft - pi_0),
+        """
+        if self.accelerator.is_main_process:
+            print(f"\n--- [Momentum Prior] Initializing momentum buffer with (\pi_sft - \pi_0) (alpha={alpha}) ---")
+
+        # 1. 临时加载 pi_0 到 CPU
+        pi_0 = transformers.AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            cache_dir=self.hf_model_cache,
+            torch_dtype=getattr(torch, self.config.model.policy_dtype),
+            device_map="cpu"
+        )
+        pi_0_state_dict = pi_0.state_dict()
+
+        # 2. 确保子类有 momentum_buffer
+        if not hasattr(self, 'momentum_buffer'):
+            self.momentum_buffer = {}
+
+        # 3. 计算并注入初始动量
+        for name, param in self.policy.named_parameters():
+            if not param.requires_grad or name not in pi_0_state_dict:
+                continue
+                
+            w_0 = pi_0_state_dict[name].to(param.device)
+            delta_w = param.data - w_0
+            
+            # 检查是否是 AGZO 且当前层存在子空间 basis
+            is_agzo = hasattr(self, '_engine')
+            basis = self._engine.basis.get(name) if is_agzo else None
+            
+            if basis is not None and param.dim() >= 2 and basis.shape[1] == param.shape[1]:
+                # 【AGZO 逻辑】将 \Delta W 投影到低维子空间: [out_features, in_features] @ [in_features, rank]
+                basis = basis.to(device=param.device, dtype=param.dtype)
+                proj_delta_w = torch.matmul(delta_w, basis.T)
+                self.momentum_buffer[name] = alpha * proj_delta_w
+            else:
+                # 【MeZO / Plain 逻辑】全空间直接保存
+                self.momentum_buffer[name] = alpha * delta_w
+
+        del pi_0
+        torch.cuda.empty_cache()
+        
+        # 多卡同步
+        if self.accelerator.num_processes > 1:
+            for name in self.momentum_buffer:
+                dist.broadcast(self.momentum_buffer[name], src=0)
+
+    # ================================================================
     # Default step implementations  (subclasses may override)
     # ================================================================
 
@@ -775,6 +828,12 @@ class ZOTrainerBase:
                 first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
                 self._collect_dpo_basis(first_gpu)
 
+                if global_step == 1 and epoch == 0 and window_start == 0:
+                    base_model_path = self.config.get("base_model_path", None)
+                    if base_model_path:
+                        sft_alpha = float(self.config.trainer.get("sft_prior_alpha", 0.1))
+                        self._init_momentum_from_sft(base_model_path, sft_alpha)
+
                 # ── DDP gradient accumulation ─────────────────────────────────
                 self._reset_seed()
                 local_g_hat = 0.0
@@ -1116,6 +1175,9 @@ class ZOTrainerBase:
             "state_dict":    state_dict,
             "rng_states":    rng_states,
             "wandb_run_id":  wandb_run_id,
+            # [新增] 保存动量和子空间基底
+            "momentum_buffer": getattr(self, "momentum_buffer", {}),
+            "prev_basis":      getattr(self, "prev_basis", {}), 
         }
 
         torch.save(payload, self._ckpt_tmp_path)
@@ -1165,6 +1227,18 @@ class ZOTrainerBase:
         if self.accelerator.is_main_process:
             print(f"  [ckpt] Resumed {stage} from step {resume_step}  "
                   f"(wandb_run_id={self.resumed_wandb_run_id})")
+        
+        # [新增] 恢复动量和子空间基底，并确保搬运回 GPU 设备
+        if hasattr(self, "momentum_buffer"):
+            mb_cpu = payload.get("momentum_buffer", {})
+            self.momentum_buffer = {k: v.to(self.accelerator.device) for k, v in mb_cpu.items()}
+            
+        if hasattr(self, "prev_basis"):
+            pb_cpu = payload.get("prev_basis", {})
+            self.prev_basis = {k: v.to(self.accelerator.device) for k, v in pb_cpu.items()}
+
+        self.resumed_wandb_run_id = payload.get("wandb_run_id", None)
+        self.accelerator.wait_for_everyone()
 
         return resume_step, loss_history
 
@@ -1213,26 +1287,34 @@ class ZOTrainerBase:
 # ============================================================
 
 class MeZOTrainer(ZOTrainerBase):
-    """
-    Memory-Efficient Zeroth-Order (MeZO) optimizer.
-    """
-
     def __init__(self, policy: nn.Module, config: DictConfig):
         super().__init__(policy, config)
-        self._params: List[nn.Parameter] = [
-            p for p in policy.parameters() if p.requires_grad
+        self._params: List[Tuple[str, nn.Parameter]] = [
+            (n, p) for n, p in policy.named_parameters() if p.requires_grad
         ]
+        # [新增] 动量配置
+        self.momentum_beta = float(config.trainer.get("momentum_beta", 0.9))
+        self.momentum_buffer: Dict[str, torch.Tensor] = {}
 
     def _perturb(self, scaling: float):
         torch.manual_seed(self._zo_seed)
-        for p in self._params:
+        for name, p in self._params:
             p.data.add_(torch.randn_like(p), alpha=scaling * self.eps)
 
     def _apply_update(self, projected_grad: float):
         torch.manual_seed(self._zo_seed)
-        for p in self._params:
+        beta = self.momentum_beta
+        
+        for name, p in self._params:
             z = torch.randn_like(p)
-            p.data.add_(z, alpha= - self.lr * projected_grad)
+            grad_est = projected_grad * z
+            
+            # [新增] 动量更新逻辑
+            if name not in self.momentum_buffer:
+                self.momentum_buffer[name] = torch.zeros_like(p)
+                
+            self.momentum_buffer[name] = beta * self.momentum_buffer[name] + (1 - beta) * grad_est
+            p.data.add_(self.momentum_buffer[name], alpha= - self.lr)
 
 
 # ============================================================

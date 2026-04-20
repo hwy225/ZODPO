@@ -28,6 +28,9 @@ export GC=16 # 这样总的等效 BS = 1 * 16 * 4(卡数) = 64
 #     EXTRA_ARGS="trainer.power_iter_steps=5 trainer.rank=${SAFE_RANK}"
 # fi
 
+export WANDB_RESUME="must"
+export WANDB_RUN_ID="4spf2olp" # 例如: export WANDB_RUN_ID="aypjp6tq"
+
 torchrun --nproc_per_node=4 train_baseline_trl.py \
     trainer="fo_baseline" \
     loss=dpo \

@@ -45,7 +45,7 @@ ${LAUNCHER} train_momentum.py \
     max_loss_threshold=15.0 \
     exp_name="${EXP_NAME}" \
     model.name_or_path="${SFT_MODEL_PATH}" \
-    model.policy_dtype=float32 \
+    model.policy_dtype=bfloat16 \
     loss.sft_model_path="${SFT_MODEL_PATH}" \
     loss.beta="${BETA}" \
     loss.num_epochs=1 \
