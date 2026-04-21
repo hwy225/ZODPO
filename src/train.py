@@ -9,7 +9,7 @@ import wandb
 import hydra
 from omegaconf import OmegaConf, DictConfig
 
-from trainer_momentum import build_trainer, disable_dropout
+from trainer import build_trainer, disable_dropout
 
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 

@@ -7,7 +7,7 @@ MY_ROOT="${SHARED_ROOT}/weiyun_zodpo"
 REPO_ROOT="${MY_ROOT}/ZODPO"
 
 # train.py is in test/, and Hydra expects config/ to be a sibling of train.py
-export CODE_DIR="${REPO_ROOT}/test"
+export CODE_DIR="${REPO_ROOT}/src"
 
 export VENV_DIR="${MY_ROOT}/venv"
 export CHECKPOINT_DIR="${MY_ROOT}/checkpoints"
