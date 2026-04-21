@@ -371,9 +371,9 @@ class ZOTrainerBase:
             completion_only_loss=True,   
             logging_steps=10,
 
-            eval_strategy="steps",  # 新版 transformers 中参数名变更为 eval_strategy
-            eval_steps=500,               # 每训练 500 步执行一次评估 (具体数值根据你的总 step 调整)
-            per_device_eval_batch_size=4, # 评估时的批次大小 (尽量设大一点以加快评估速度，不爆显存即可)
+            eval_strategy="steps",
+            eval_steps=500,
+            per_device_eval_batch_size=4,
 
             save_strategy="steps",
             save_steps=500,
@@ -597,9 +597,6 @@ class ZOTrainerBase:
                 self._collect_dpo_basis(first_gpu)
 
                 # ── DDP gradient accumulation ─────────────────────────────────
-                # The window of grad_accum mini-batches is split across ranks.
-                # rank r processes window[r], window[r + n_proc], window[r + 2*n_proc], ...
-                # Each rank accumulates its own local g_hat, then we all_reduce.
                 self._reset_seed()
                 local_g_hat = 0.0
                 local_loss  = 0.0

@@ -8,3 +8,6 @@ lr: 1e-6
 
 # finite-difference epsilon (perturbation step size)
 eps: 1e-3
+
+warmup_ratio: 0.1
+lr_scheduler_type: cosine

@@ -1,23 +1,12 @@
 #!/usr/bin/env bash
-# =============================================================================
-# sweep_momentum.sh  —  submit a grid of DPO hyperparameter experiments for LOZO-M
-#
-# Run from ZODPO/:
-#   bash jobs/sweep_momentum.sh agzo sft_qwen1.7b
-# =============================================================================
-
 TRAINER="${1:?Usage: bash sweep_momentum.sh <trainer> <sft_exp_name>}"
 SFT_EXP="${2:?Usage: bash sweep_momentum.sh <trainer> <sft_exp_name>}"
 
 # ── Hyperparameter grid ───────────────────────────────────────────────────────
-# 新增了两列: m_beta (动量衰减系数) 和 rank
-# Each row: "lr eps dpo_beta bs gc m_beta rank"
+# Each row: "lr eps dpo_beta bs gc m_beta rank warmup_ratio"
 CONFIGS=(
-    # 推荐的搜索网格 (在确保是 fp32 的前提下，可以尝试较大的 lr)
-    # "1e-6  1e-3  0.1  4  16  0.9   1"
-    "1e-6  1e-4  0.1  16  4  0.9   1"
-    # "1e-6  1e-4  0.1  4  16  0.95  1"
-    # "1e-6  1e-4  0.1  4  16  0.99  1"
+    "1e-6  1e-4  0.1  4  16  0.5   1 0.03"
+    "1e-6  1e-4  0.1  4  16  0.5   1 0.05"
 )
 
 SHARED_ROOT="/mimer/NOBACKUP/groups/ga_llm_hri"
@@ -32,19 +21,19 @@ fi
 mkdir -p "${MY_ROOT}/logs"
 
 for config in "${CONFIGS[@]}"; do
-    # 解析新增的参数
-    read -r lr eps beta bs gc m_beta rank <<< "$config"
+    read -r lr eps beta bs gc m_beta rank wr <<< "$config"
 
     # Format tags
     lr_tag=$(echo "$lr"  | sed 's/e-/em/;s/\./_/')
     eps_tag=$(echo "$eps" | sed 's/e-/em/;s/\./_/')
     b_tag=$(echo "$beta"  | sed 's/0\./b/;s/\.//')
-    mbeta_tag=$(echo "$m_beta" | sed 's/0\./mb/;s/\.//') # 例: 0.9 -> mb9, 0.95 -> mb95
+    mbeta_tag=$(echo "$m_beta" | sed 's/0\./mb/;s/\.//') # e.g. 0.9 -> mb9, 0.95 -> mb95
     bs_tag=$(echo "$bs")
     gc_tag=$(echo "$gc")
     rank_tag=$(echo "$rank")
+    wr_tag=$(echo "$wr" | sed 's/0\./wr/;s/\./_/')
     
-    EXP_NAME="dpo_bf16_${TRAINER}_bs${bs_tag}_gc${gc_tag}_lr${lr_tag}_eps${eps_tag}_mbeta${mbeta_tag}_$(date +%Y%m%d)"
+    EXP_NAME="dpo_bf16_${TRAINER}_bs${bs_tag}_gc${gc_tag}_cosine_${wr_tag}_lr${lr_tag}_eps${eps_tag}_${mbeta_tag}_$(date +%Y%m%d)"
 
     echo "Submitting: $EXP_NAME"
 
@@ -53,7 +42,7 @@ for config in "${CONFIGS[@]}"; do
         --output="${MY_ROOT}/logs/${EXP_NAME}_%j.out" \
         --error="${MY_ROOT}/logs/${EXP_NAME}_%j.err" \
         --export=ALL,EXP_NAME="$EXP_NAME",SFT_MODEL_PATH="$SFT_MODEL_PATH",\
-LR="$lr",EPS="$eps",BETA="$beta",BS="$bs",GC="$gc",MBETA="$m_beta",RANK="$rank",TRAINER="$TRAINER" \
+LR="$lr",EPS="$eps",BETA="$beta",BS="$bs",GC="$gc",MBETA="$m_beta",RANK="$rank",WR="$wr",TRAINER="$TRAINER" \
         "$(dirname "$0")/sweep_dpo_momentum_worker.sh"
 
     sleep 1

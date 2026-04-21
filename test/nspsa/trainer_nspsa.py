@@ -340,11 +340,9 @@ class ZOTrainerBase:
             gradient_checkpointing=True,
             completion_only_loss=True,   
             logging_steps=10,
-
-            eval_strategy="steps",  # 新版 transformers 中参数名变更为 eval_strategy
-            eval_steps=500,               # 每训练 500 步执行一次评估 (具体数值根据你的总 step 调整)
-            per_device_eval_batch_size=4, # 评估时的批次大小 (尽量设大一点以加快评估速度，不爆显存即可)
-
+            eval_strategy="steps",
+            eval_steps=500,
+            per_device_eval_batch_size=4,
             save_strategy="steps",
             save_steps=500,
             save_total_limit=1,

@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# sweep_dpo.sh  —  submit a grid of DPO hyperparameter experiments
-#
-# Run from ZODPO/:
-#   bash jobs/sweep_dpo.sh agzo sft_qwen1.7b
-#
-# Args:
-#   $1  trainer name: mezo | agzo | agzo_plain
-#   $2  SFT exp name (the directory under $RUNS_DIR)
-# =============================================================================
-
 TRAINER="${1:?Usage: bash sweep_dpo.sh <trainer> <sft_exp_name>}"
 SFT_EXP="${2:?Usage: bash sweep_dpo.sh <trainer> <sft_exp_name>}"
 

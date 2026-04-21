@@ -16,3 +16,6 @@ power_iter_steps: 5
 # rank=1 is sufficient for most cases; higher rank uses more memory but
 # captures a richer subspace of activation differences
 rank: 1
+
+warmup_ratio: 0.1
+lr_scheduler_type: cosine

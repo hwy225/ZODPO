@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# sweep_dpo_worker.sh  —  single DPO job, parameterised by env vars
-#
-# Do NOT submit directly. Called by sweep_dpo.sh via sbatch --export.
-# Env vars: EXP_NAME, SFT_MODEL_PATH, LR, EPS, BETA, BS, GC, TRAINER, N_GPU
-# =============================================================================
-
-#SBATCH -A NAISS2025-22-869
-#SBATCH -p alvis
-#SBATCH --gpus-per-node=A40:${N_GPU:-1}
-#SBATCH -t 4:00:00
-#SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=weiyun.huang.2798@student.uu.se
-
 set -euo pipefail
 
 source "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/ZODPO/jobs/common_header.sh"

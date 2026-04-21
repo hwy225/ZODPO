@@ -176,12 +176,16 @@ class ZOTrainerBase:
         self.policy        = policy
         disable_dropout(self.policy)
         self.config        = config
-        self.lr            = config.trainer.lr
+        self.base_lr       = config.trainer.lr
+        self.lr            = 0.0
         self.eps           = config.trainer.eps
+
+        self.warmup_ratio      = float(config.trainer.get("warmup_ratio", 0.1))
+        self.lr_scheduler_type = config.trainer.get("lr_scheduler_type", "linear") # 支持 linear, cosine, constant
+
         self.total_batches = config.total_batches
         self._zo_seed: int = 0
 
-        # 从 config 中读取配置，提供安全默认值
         self.compute_logps_fp32 = config.get("compute_logps_fp32", True)
         self.max_loss_threshold = float(config.get("max_loss_threshold", 10.0))
         self.max_margin_threshold = float(config.get("max_margin_threshold", float('inf')))
@@ -236,6 +240,38 @@ class ZOTrainerBase:
     def _apply_update(self, projected_grad: float):
         raise NotImplementedError
 
+
+    # ================================================================
+    # Learning rate scheduler
+    # ================================================================
+
+    def _get_lr(self, current_step: int, total_steps: int) -> float:
+        """Compute the learning rate for the current step, applying warmup and decay according to config."""
+        if self.lr_scheduler_type == "constant":
+            return self.base_lr
+
+        warmup_steps = int(total_steps * self.warmup_ratio)
+
+        # Linear Warmup
+        if current_step <= warmup_steps:
+            if warmup_steps == 0:
+                return self.base_lr
+            return self.base_lr * (current_step / warmup_steps)
+
+        # Decay
+        decay_steps = max(1, total_steps - warmup_steps)
+        steps_since_warmup = current_step - warmup_steps
+
+        if self.lr_scheduler_type == "linear":
+            decay_ratio = 1.0 - (steps_since_warmup / decay_steps)
+            return max(0.0, self.base_lr * decay_ratio)
+            
+        elif self.lr_scheduler_type == "cosine":
+            decay_ratio = 0.5 * (1.0 + math.cos(math.pi * steps_since_warmup / decay_steps))
+            return max(0.0, self.base_lr * decay_ratio)
+            
+        return self.base_lr
+
     # ================================================================
     # Seed management
     # ================================================================
@@ -281,7 +317,7 @@ class ZOTrainerBase:
         if self.accelerator.is_main_process:
             print(f"\n--- [Momentum Prior] Initializing momentum buffer with (\pi_sft - \pi_0) (alpha={alpha}) ---")
 
-        # 1. 临时加载 pi_0 到 CPU
+        # Load SFT model on CPU to get the initial weights (pi_0)
         pi_0 = transformers.AutoModelForCausalLM.from_pretrained(
             base_model_path,
             cache_dir=self.hf_model_cache,
@@ -290,11 +326,11 @@ class ZOTrainerBase:
         )
         pi_0_state_dict = pi_0.state_dict()
 
-        # 2. 确保子类有 momentum_buffer
+        # make sure momentum_buffer exists
         if not hasattr(self, 'momentum_buffer'):
             self.momentum_buffer = {}
 
-        # 3. 计算并注入初始动量
+        # compute the difference and initialize momentum_buffer
         for name, param in self.policy.named_parameters():
             if not param.requires_grad or name not in pi_0_state_dict:
                 continue
@@ -302,23 +338,23 @@ class ZOTrainerBase:
             w_0 = pi_0_state_dict[name].to(param.device)
             delta_w = param.data - w_0
             
-            # 检查是否是 AGZO 且当前层存在子空间 basis
+            # check subspace basis if AGZO
             is_agzo = hasattr(self, '_engine')
             basis = self._engine.basis.get(name) if is_agzo else None
             
             if basis is not None and param.dim() >= 2 and basis.shape[1] == param.shape[1]:
-                # 【AGZO 逻辑】将 \Delta W 投影到低维子空间: [out_features, in_features] @ [in_features, rank]
+                # AGZO: projection - [out_features, in_features] @ [in_features, rank]
                 basis = basis.to(device=param.device, dtype=param.dtype)
                 proj_delta_w = torch.matmul(delta_w, basis.T)
                 self.momentum_buffer[name] = alpha * proj_delta_w
             else:
-                # 【MeZO / Plain 逻辑】全空间直接保存
+                # MeZO/Plain AGZO: direct difference
                 self.momentum_buffer[name] = alpha * delta_w
 
         del pi_0
         torch.cuda.empty_cache()
         
-        # 多卡同步
+        # multi-GPU broadcast to sync momentum_buffer across ranks
         if self.accelerator.num_processes > 1:
             for name in self.momentum_buffer:
                 dist.broadcast(self.momentum_buffer[name], src=0)
@@ -785,6 +821,9 @@ class ZOTrainerBase:
         global_step = 1
         stop_training = False
 
+        total_steps = n_epochs * (n_batches // grad_accum)
+        if total_steps == 0: total_steps = 1
+
         for epoch in range(n_epochs):
             if stop_training:
                 break
@@ -921,7 +960,7 @@ class ZOTrainerBase:
                         local_sample_count,
                     ])
                     dist.all_reduce(reward_vec, op=dist.ReduceOp.SUM)
-                    n_samples = max(reward_vec[6].item(), 1.0)
+                    n_samples = max(reward_vec[8].item(), 1.0)
                     train_metrics = {
                         "train/rewards/chosen":    (reward_vec[0] / n_samples).item(),
                         "train/rewards/rejected":  (reward_vec[1] / n_samples).item(),
@@ -929,6 +968,8 @@ class ZOTrainerBase:
                         "train/rewards/accuracies":(reward_vec[3] / n_samples).item(),
                         "train/logps/chosen":      (reward_vec[4] / n_samples).item(),
                         "train/logps/rejected":    (reward_vec[5] / n_samples).item(),
+                        "train/logits/chosen":     (reward_vec[6] / n_samples).item(),
+                        "train/logits/rejected":   (reward_vec[7] / n_samples).item(),
                     }
                 else:
                     total_g_hat = local_g_hat
@@ -942,6 +983,8 @@ class ZOTrainerBase:
                         "train/rewards/accuracies":(local_accuracy_sum        / n_samples).item(),
                         "train/logps/chosen":      (local_logps_chosen_sum    / n_samples).item(),
                         "train/logps/rejected":    (local_logps_rejected_sum  / n_samples).item(),
+                        "train/logits/chosen":     (local_logits_chosen_sum   / n_samples).item(),
+                        "train/logits/rejected":   (local_logits_rejected_sum / n_samples).item(),
                     }
 
                 g_hat    = total_g_hat / max(total_count, 1)
@@ -950,26 +993,26 @@ class ZOTrainerBase:
                 clip_val = 0.05 / self.eps
                 g_hat = max(min(g_hat, clip_val), -clip_val)
 
+                # Update lr
+                self.lr = self._get_lr(global_step, total_steps)
+
                 self._apply_update(g_hat)
                 loss_history.append(avg_loss)
 
                 if self.accelerator.is_main_process:
-                    # 计算小数 epoch (已过去的 batch 数量 / 总 batch 数量)
                     fractional_epoch = epoch + (window_start / len(indices))
                     
                     log_dict = {
-                        "train/loss":                 avg_loss, # TRL 名字是 train/loss
-                        "train/learning_rate":        self.lr,  # TRL 名字
-                        "train/epoch":                fractional_epoch, # TRL 名字
-                        "train/global_step":          global_step, # TRL 名字
+                        "train/loss":                 avg_loss,
+                        "train/learning_rate":        self.lr,
+                        "train/epoch":                fractional_epoch,
+                        "train/global_step":          global_step,
                         "train/grad_norm":            abs(g_hat),
-                        "train/g_hat":                total_g_hat / max(total_count, 1), # 保留你的特有指标
+                        "train/g_hat":                total_g_hat / max(total_count, 1),
                         "hparams/eps":                self.eps,
                         "hparams/beta":               beta,
                         **train_metrics,
                     }
-                    if getattr(self, "_last_margin", None) is not None:
-                        log_dict["train/margin"] = self._last_margin
                     if self.config.wandb.enabled:
                         wandb.log(log_dict)
 
@@ -997,6 +1040,13 @@ class ZOTrainerBase:
                     self._save_checkpoint("dpo", global_step, loss_history)
 
                 global_step += 1
+
+                max_steps = int(self.config.get("max_steps", -1))
+                if max_steps > 0 and global_step > max_steps:
+                    if self.accelerator.is_main_process:
+                        print(f"\n[Info] Reached max_steps ({max_steps}). Stopping training.")
+                    stop_training = True
+                    break
 
         if stop_training:
             if self.accelerator.is_main_process:
@@ -1175,7 +1225,7 @@ class ZOTrainerBase:
             "state_dict":    state_dict,
             "rng_states":    rng_states,
             "wandb_run_id":  wandb_run_id,
-            # [新增] 保存动量和子空间基底
+            # save momentum buffer and basis for AGZO
             "momentum_buffer": getattr(self, "momentum_buffer", {}),
             "prev_basis":      getattr(self, "prev_basis", {}), 
         }
@@ -1228,7 +1278,6 @@ class ZOTrainerBase:
             print(f"  [ckpt] Resumed {stage} from step {resume_step}  "
                   f"(wandb_run_id={self.resumed_wandb_run_id})")
         
-        # [新增] 恢复动量和子空间基底，并确保搬运回 GPU 设备
         if hasattr(self, "momentum_buffer"):
             mb_cpu = payload.get("momentum_buffer", {})
             self.momentum_buffer = {k: v.to(self.accelerator.device) for k, v in mb_cpu.items()}
@@ -1292,7 +1341,6 @@ class MeZOTrainer(ZOTrainerBase):
         self._params: List[Tuple[str, nn.Parameter]] = [
             (n, p) for n, p in policy.named_parameters() if p.requires_grad
         ]
-        # [新增] 动量配置
         self.momentum_beta = float(config.trainer.get("momentum_beta", 0.9))
         self.momentum_buffer: Dict[str, torch.Tensor] = {}
 
@@ -1309,7 +1357,6 @@ class MeZOTrainer(ZOTrainerBase):
             z = torch.randn_like(p)
             grad_est = projected_grad * z
             
-            # [新增] 动量更新逻辑
             if name not in self.momentum_buffer:
                 self.momentum_buffer[name] = torch.zeros_like(p)
                 
@@ -1476,13 +1523,12 @@ class AGZOTrainer(ZOTrainerBase):
         self._params: List[Tuple[str, nn.Parameter]] = [
             (n, p) for n, p in policy.named_parameters() if p.requires_grad
         ]
-        # --- [NEW] LOZO-M 动量配置 ---
         self.momentum_beta = float(tcfg.get("momentum_beta", 0.9))
         self.momentum_buffer: Dict[str, torch.Tensor] = {}
         self.prev_basis: Dict[str, torch.Tensor] = {}
 
     def _project_momentum(self):
-        """将旧子空间的动量投影到新激活子空间中 (实现 LOZO Eq. 21)"""
+        """Project existing momentum into the new basis after each basis update"""
         if not self.momentum_buffer:
             return
             
@@ -1552,10 +1598,6 @@ class AGZOTrainer(ZOTrainerBase):
             B=B,
         )
         logits = output.logits
-        self._last_margin = (
-            get_batch_logps(logits[:B], gpu_batch['chosen_labels'], self.compute_logps_fp32)
-            - get_batch_logps(logits[B:], gpu_batch['rejected_labels'], self.compute_logps_fp32)
-        ).mean().item()
 
         self._project_momentum()
         self.prev_basis = {k: v.clone() for k, v in self._engine.basis.items()}
@@ -1567,7 +1609,7 @@ class AGZOTrainer(ZOTrainerBase):
             param.data.add_(z, alpha=scaling * self.eps)
 
     def _apply_update(self, projected_grad: float):
-        """应用带有 LOZO-M 子空间动量的更新"""
+        """Apply the AGZO update using the current basis, with momentum if enabled"""
         torch.manual_seed(self._zo_seed)
         beta = self.momentum_beta
         
@@ -1616,10 +1658,6 @@ class AGZOPlainTrainer(AGZOTrainer):
             lambda: self.policy(ids, attention_mask=mask)
         )
         logits = output.logits
-        self._last_margin = (
-            get_batch_logps(logits[:B], gpu_batch['chosen_labels'], self.compute_logps_fp32)
-            - get_batch_logps(logits[B:], gpu_batch['rejected_labels'], self.compute_logps_fp32)
-        ).mean().item()
 
         self._project_momentum()
         self.prev_basis = {k: v.clone() for k, v in self._engine.basis.items()}

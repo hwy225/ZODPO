@@ -1,20 +1,3 @@
-"""
-trainer_ddp_empty_run.py
-========================
-Adds an ``EmptyRunMixin`` that monkey-patches ``_apply_update`` to a no-op,
-so you can observe the raw ZO loss signal (and check whether half-precision
-perturbations corrupt model parameters) without actually updating θ.
-
-Usage
------
-Replace ``from trainer_ddp import build_trainer`` with
-``from trainer_ddp_empty_run import build_trainer`` in train_ddp.py,
-OR use the provided ``train_ddp_empty_run.py`` entry-point directly.
-
-The perturbation loop (_perturb +1 / -2 / +1) is intentionally KEPT intact
-so the half-precision numeric corruption diagnostic is valid.
-"""
-
 import copy
 import math
 import os
@@ -28,8 +11,7 @@ import wandb
 import tqdm
 from omegaconf import DictConfig
 
-# Re-export everything from the original trainer so callers only need to
-# import from this module.
+# Re-export everything from the original trainer so callers only need to import from this module.
 from trainer_ddp import (
     ZOTrainerBase,
     MeZOTrainer,
@@ -128,14 +110,8 @@ class EmptyRunMixin:
         # Reset snapshot for the next step
         self._snapshot = None
 
-
-# ============================================================
-# Concrete empty-run trainer classes
-# ============================================================
-
 # ============================================================
 # Patch _run_dpo to track global_step_for_drift
-# (提前定义，方便直接继承)
 # ============================================================
 class _StepTrackingMixin:
     """Keep _global_step_for_drift in sync with the real global_step."""

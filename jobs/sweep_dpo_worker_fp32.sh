@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# sweep_dpo_worker.sh  —  single DPO job, parameterised by env vars
-#
-# Do NOT submit directly. Called by sweep_dpo.sh via sbatch --export.
-# =============================================================================
-
 #SBATCH -A NAISS2025-22-869
 #SBATCH -p alvis
 #SBATCH --gpus-per-node=A100:1

@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# sweep_momentum_worker.sh
-# =============================================================================
-
 #SBATCH -A NAISS2025-22-869
 #SBATCH -p alvis
 #SBATCH --gpus-per-node=A40:2
@@ -17,7 +13,7 @@ source "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/ZODPO/jobs/common_header.
 echo "=== Sweep job ==="
 echo "EXP_NAME : ${EXP_NAME}"
 echo "TRAINER  : ${TRAINER}"
-echo "lr=${LR} eps=${EPS} beta=${BETA} batch_size=${BS} gradient_accum=${GC} m_beta=${MBETA} rank=${RANK}"
+echo "wr=${WR} lr=${LR} eps=${EPS} beta=${BETA} batch_size=${BS} gradient_accum=${GC} m_beta=${MBETA} rank=${RANK}"
 echo "SFT      : ${SFT_MODEL_PATH}"
 echo "================="
 
@@ -25,7 +21,7 @@ N_GPU=2
 
 EXTRA_ARGS=""
 if [[ "${TRAINER}" == "agzo" || "${TRAINER}" == "agzo_plain" ]]; then
-    # 将接收到的 RANK 和 MBETA 参数传入 Hydra 配置
+    # Add AGZO-specific hyperparameters
     EXTRA_ARGS="trainer.power_iter_steps=5 trainer.rank=${RANK} +trainer.momentum_beta=${MBETA}"
 fi
 
@@ -37,12 +33,13 @@ else
     LAUNCHER="python"
 fi
 
-# 🚨 警告：这里已经帮你强制改回了 float32！绝对不能用 bfloat16！
 ${LAUNCHER} train_momentum.py \
     trainer="${TRAINER}" \
     loss=dpo \
     compute_logps_fp32=True \
     max_loss_threshold=15.0 \
+    max_steps=1000 \
+    eval_every=50 \
     exp_name="${EXP_NAME}" \
     model.name_or_path="${SFT_MODEL_PATH}" \
     model.policy_dtype=bfloat16 \
@@ -51,6 +48,8 @@ ${LAUNCHER} train_momentum.py \
     loss.num_epochs=1 \
     trainer.lr="${LR}" \
     trainer.eps="${EPS}" \
+    trainer.warmup_ratio="${WR}" \
+    trainer.lr_scheduler_type="cosine" \
     ${EXTRA_ARGS} \
     batch_size="${BS}" \
     gradient_accumulation_steps="${GC}" \

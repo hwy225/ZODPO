@@ -12,3 +12,6 @@ lr: 1e-6
 eps: 1e-3
 power_iter_steps: 5
 rank: 1
+
+warmup_ratio: 0.1
+lr_scheduler_type: cosine

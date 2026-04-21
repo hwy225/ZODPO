@@ -1,31 +1,3 @@
-"""
-train_ddp_empty_run.py
-======================
-Drop-in replacement for train_ddp.py that:
-
-  1. Runs the FULL ZO forward-pass / perturbation loop (same random state).
-  2. Skips ALL parameter updates (_apply_update is a no-op).
-  3. Logs per-step loss curves AND per-step max parameter drift to W&B /
-     stdout so you can tell whether fp16/bf16 perturbations are already
-     corrupting θ.
-  4. Runs the entire diagnostic in BOTH fp32 and the configured half
-     precision (fp16 or bf16), back-to-back, starting from the same
-     checkpoint, so the two loss curves are directly comparable.
-
-Launch exactly like train_ddp.py::
-
-    torchrun --nproc_per_node=<N> train_ddp_empty_run.py \\
-        trainer.name=mezo loss.name=dpo \\
-        model.policy_dtype=float16        # or bfloat16
-        empty_run=true                    # activates no-update mode
-        [other overrides …]
-
-To compare fp32 vs half-precision in a single run, set::
-
-    empty_run=true
-    run_dual_precision_compare=true      # run fp32 first, then half
-"""
-
 import copy
 import os
 import random
