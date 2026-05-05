@@ -220,6 +220,7 @@ class ZOTrainerBase:
         self.runs_dir: str = os.path.join(runs_base, exp, stage)
 
         self.checkpoint_every: int = int(config.get("checkpoint_every", 20))
+        self.save_total_limit: int = int(config.get("save_total_limit", 1))
         self.resumed_wandb_run_id: Optional[str] = None
 
         # ── eval config ─────────────────────────────────────────────
@@ -645,7 +646,7 @@ class ZOTrainerBase:
 
             save_strategy="steps",
             save_steps=500,
-            save_total_limit=1,
+            save_total_limit=int(self.config.get("save_total_limit", 1)),
             bf16=(self.config.model.policy_dtype == "bfloat16"),
             fp16=(self.config.model.policy_dtype == "float16"),
             report_to="wandb" if self.config.wandb.enabled else "none",
@@ -1189,13 +1190,11 @@ class ZOTrainerBase:
     # Checkpoint helpers
     # ================================================================
 
-    @property
-    def _ckpt_path(self) -> str:
-        return os.path.join(self.ckpt_dir, "checkpoint.pt")
+    def _get_ckpt_path(self, step: int) -> str:
+        return os.path.join(self.ckpt_dir, f"checkpoint-{step}.pt")
 
-    @property
-    def _ckpt_tmp_path(self) -> str:
-        return os.path.join(self.ckpt_dir, "checkpoint.pt.tmp")
+    def _get_ckpt_tmp_path(self, step: int) -> str:
+        return os.path.join(self.ckpt_dir, f"checkpoint-{step}.pt.tmp")
 
     def _save_checkpoint(self, stage: str, step: int, loss_history: List[float]):
         if not self.accelerator.is_main_process:
@@ -1225,25 +1224,66 @@ class ZOTrainerBase:
             "state_dict":    state_dict,
             "rng_states":    rng_states,
             "wandb_run_id":  wandb_run_id,
-            # save momentum buffer and basis for AGZO
             "momentum_buffer": getattr(self, "momentum_buffer", {}),
             "prev_basis":      getattr(self, "prev_basis", {}), 
         }
 
-        torch.save(payload, self._ckpt_tmp_path)
-        os.replace(self._ckpt_tmp_path, self._ckpt_path)
+        ckpt_tmp = self._get_ckpt_tmp_path(step)
+        ckpt_final = self._get_ckpt_path(step)
 
-        print(f"  [ckpt] Saved checkpoint step={step} --> {self._ckpt_path}")
+        torch.save(payload, ckpt_tmp)
+        os.replace(ckpt_tmp, ckpt_final)
+
+        print(f"  [ckpt] Saved checkpoint step={step} --> {ckpt_final}")
+
+        # cleanup old checkpoints
+        if self.save_total_limit > 0:
+            import re
+            valid_ckpts = []
+            for f in os.listdir(self.ckpt_dir):
+                match = re.match(r"checkpoint-(\d+)\.pt$", f)
+                if match:
+                    valid_ckpts.append((int(match.group(1)), os.path.join(self.ckpt_dir, f)))
+            
+            # sort by step number (ascending)
+            valid_ckpts.sort(key=lambda x: x[0])
+            
+            # delete earliest checkpoints if we have more than the limit
+            if len(valid_ckpts) > self.save_total_limit:
+                ckpts_to_delete = valid_ckpts[:-self.save_total_limit]
+                for _, path in ckpts_to_delete:
+                    try:
+                        os.remove(path)
+                        print(f"  [ckpt] Deleted old checkpoint --> {path}")
+                    except Exception as e:
+                        print(f"  [ckpt] WARNING: Failed to delete {path}: {e}")
 
     def _try_resume(self, stage: str) -> Tuple[int, List[float]]:
-        if not os.path.exists(self._ckpt_path):
+        if not os.path.exists(self.ckpt_dir):
             return 0, []
 
+        import re
+        valid_ckpts = []
+        for f in os.listdir(self.ckpt_dir):
+            match = re.match(r"checkpoint-(\d+)\.pt$", f)
+            if match:
+                valid_ckpts.append((int(match.group(1)), os.path.join(self.ckpt_dir, f)))
+        
+        old_ckpt_path = os.path.join(self.ckpt_dir, "checkpoint.pt")
+        if os.path.exists(old_ckpt_path):
+            valid_ckpts.append((-1, old_ckpt_path))
+            
+        if not valid_ckpts:
+            return 0, []
+            
+        valid_ckpts.sort(key=lambda x: x[0])
+        latest_ckpt_path = valid_ckpts[-1][1]
+
         try:
-            payload = torch.load(self._ckpt_path, map_location="cpu",
+            payload = torch.load(latest_ckpt_path, map_location="cpu",
                                  weights_only=False)
         except Exception as e:
-            print(f"  [ckpt] WARNING: failed to load checkpoint ({e}). "
+            print(f"  [ckpt] WARNING: failed to load checkpoint {latest_ckpt_path} ({e}). "
                   f"Starting from scratch.")
             return 0, []
 
@@ -1310,14 +1350,7 @@ class ZOTrainerBase:
         self.tokenizer.save_pretrained(out_dir)
 
         print(f"  [final] Model saved --> {out_dir}")
-
-        if os.path.exists(self.ckpt_dir):
-            try:
-                shutil.rmtree(self.ckpt_dir)
-                print(f"  [cleanup] Successfully deleted checkpoint directory --> {self.ckpt_dir}")
-            except Exception as e:
-                print(f"  [cleanup] WARNING: Failed to delete checkpoint directory {self.ckpt_dir}. Error: {e}")
-
+        
         self.accelerator.wait_for_everyone()
 
     def save(self, _output_dir: str):
