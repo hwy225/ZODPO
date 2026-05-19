@@ -70,7 +70,7 @@ def load_hh_test_prompts(tokenizer, num_samples: int = 500, seed: int = 42, cach
             plain_context += f"{role_name}: {m['content']}\n\n"
         
         prompts.append({
-            "id": len(prompts),  # 使用当前列表长度作为纯数字 ID (0 到 num_samples-1)
+            "id": len(prompts),
             "prompt_templated": templated_prompt, 
             "prompt_plain": plain_context.strip(), 
             "reference": reference_msg,

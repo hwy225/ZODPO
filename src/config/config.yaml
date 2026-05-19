@@ -33,7 +33,8 @@ hf_dataset_cache_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/.cache/huggingface/data
 checkpoint_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/checkpoints"
 
 runs_dir: "/mimer/NOBACKUP/groups/ga_llm_hri/weiyun_zodpo/runs"
-checkpoint_every: 50
+checkpoint_every: 100
+save_total_limit: 1
 
 eval_every: 50
 eval_batches: 200

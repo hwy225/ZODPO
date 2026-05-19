@@ -181,7 +181,9 @@ class ZOTrainerBase:
         self.eps           = config.trainer.eps
 
         self.warmup_ratio      = float(config.trainer.get("warmup_ratio", 0.1))
-        self.lr_scheduler_type = config.trainer.get("lr_scheduler_type", "linear") # 支持 linear, cosine, constant
+        self.lr_scheduler_type = config.trainer.get("lr_scheduler_type", "linear") # supports linear, cosine, constant
+
+        self.basis_update_freq = int(config.trainer.get("basis_update_freq", 1))
 
         self.total_batches = config.total_batches
         self._zo_seed: int = 0
@@ -634,7 +636,7 @@ class ZOTrainerBase:
             gradient_accumulation_steps=int(self.config.get("gradient_accumulation_steps", 1)),
             learning_rate=float(sft_cfg.get("lr", 5e-5)),
             lr_scheduler_type=sft_cfg.get("lr_scheduler_type", "cosine"),
-            warmup_ratio=float(sft_cfg.get("warmup_ratio", 0.03)),
+            warmup_ratio=float(sft_cfg.get("warmup_ratio", 0.1)),
             max_length=self.config.max_length,
             gradient_checkpointing=True,
             completion_only_loss=True,   
@@ -699,17 +701,27 @@ class ZOTrainerBase:
         n_epochs   = int(loss_cfg.get("num_epochs", 1))
         grad_accum = int(self.config.get("gradient_accumulation_steps", 1))
 
+        max_steps  = int(self.config.get("max_steps", -1))
+
         eff_bs = self.config.batch_size * grad_accum
-        use_full_dataset = (loss_cfg.get("num_epochs", None) is not None)
-        n_examples = None if use_full_dataset else self.total_batches * self.config.batch_size
+
+        if max_steps > 0:
+            n_examples = max_steps * eff_bs
+            step_suffix = f"_steps{max_steps}"
+        else:
+            use_full_dataset = (loss_cfg.get("num_epochs", None) is not None)
+            n_examples = None if use_full_dataset else self.total_batches * self.config.batch_size
+            step_suffix = ""
+
 
         sft_stage_dir = os.path.dirname(os.path.normpath(ref_path))  
         os.makedirs(sft_stage_dir, exist_ok=True)
         
         fp32_suffix = "_fp32" if self.compute_logps_fp32 else ""
+        
         cache_file = os.path.join(
             sft_stage_dir,
-            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}_bfloat16{fp32_suffix}.pt"
+            f"ref_logps_bs{self.config.batch_size}_gc{grad_accum}{step_suffix}_bfloat16{fp32_suffix}.pt"
         )
 
         if os.path.exists(cache_file):
@@ -787,11 +799,12 @@ class ZOTrainerBase:
             del ref_model
             torch.cuda.empty_cache()
 
+        eval_examples = self.eval_batches * self.config.batch_size if self.eval_batches is not None else None
         # ── Prepare eval data (with cached ref logps) ────────────────
         eval_batches_list, ref_eval_logps = self._prepare_eval_data(
             ref_path=ref_path,
             beta=beta,
-            n_examples=n_examples,
+            n_examples=eval_examples,
         ) if self.eval_every > 0 else ([], [])
 
         n_batches = len(ref_logps)
@@ -817,6 +830,13 @@ class ZOTrainerBase:
                 global_step=0,
                 wandb_enabled=self.config.wandb.enabled,
             )
+        
+        # memory test
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        if self.accelerator.is_main_process:
+            print("\n>>> [Memory Sweep] Peak memory stats reset. Starting pure training loop... <<<\n")
 
         self.policy.train()
         global_step = 1
@@ -832,6 +852,8 @@ class ZOTrainerBase:
             print(f"\nEpoch {epoch + 1}/{n_epochs}")
 
             indices = list(range(n_batches))
+            
+            random.seed(1 + epoch)
             random.shuffle(indices)
 
             train_iter = get_chat_template_iterator(
@@ -861,12 +883,13 @@ class ZOTrainerBase:
                 window = indices[window_start : window_start + grad_accum]
 
                 # ── basis collection (AGZO only, from first batch in window) ──
-                first_batch = epoch_batches[window[0]]
-                first_ref_c, first_ref_r = ref_logps[window[0]]
-                first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
-                first_gpu['ref_chosen_logps']  = first_ref_c.to(self.accelerator.device)
-                first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
-                self._collect_dpo_basis(first_gpu)
+                if (global_step - 1) % self.basis_update_freq == 0:
+                    first_batch = epoch_batches[window[0]]
+                    first_ref_c, first_ref_r = ref_logps[window[0]]
+                    first_gpu = {k: v.to(self.accelerator.device) for k, v in first_batch.items()}
+                    first_gpu['ref_chosen_logps']  = first_ref_c.to(self.accelerator.device)
+                    first_gpu['ref_rejected_logps'] = first_ref_r.to(self.accelerator.device)
+                    self._collect_dpo_basis(first_gpu)
 
                 if global_step == 1 and epoch == 0 and window_start == 0:
                     base_model_path = self.config.get("base_model_path", None)
@@ -1042,10 +1065,15 @@ class ZOTrainerBase:
 
                 global_step += 1
 
-                max_steps = int(self.config.get("max_steps", -1))
                 if max_steps > 0 and global_step > max_steps:
                     if self.accelerator.is_main_process:
                         print(f"\n[Info] Reached max_steps ({max_steps}). Stopping training.")
+                        # print peak memory stats
+                        if torch.cuda.is_available():
+                            peak_mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                            print(f"\n" + "="*45)
+                            print(f"=== EXACT PEAK MEMORY: {peak_mem_gb:.2f} GB ===")
+                            print("="*45 + "\n")
                     stop_training = True
                     break
 
@@ -1053,12 +1081,12 @@ class ZOTrainerBase:
             if self.accelerator.is_main_process:
                 print("  [Info] Skipping final model save due to divergence.")
                 
-            if os.path.exists(self.ckpt_dir):
-                try:
-                    shutil.rmtree(self.ckpt_dir)
-                    print(f"  [cleanup] Successfully deleted checkpoint directory --> {self.ckpt_dir}")
-                except Exception as e:
-                    print(f"  [cleanup] WARNING: Failed to delete checkpoint directory {self.ckpt_dir}. Error: {e}")
+            # if os.path.exists(self.ckpt_dir):
+            #     try:
+            #         shutil.rmtree(self.ckpt_dir)
+            #         print(f"  [cleanup] Successfully deleted checkpoint directory --> {self.ckpt_dir}")
+            #     except Exception as e:
+            #         print(f"  [cleanup] WARNING: Failed to delete checkpoint directory {self.ckpt_dir}. Error: {e}")
         else:
             # ── final eval before saving ──────────────────────────────
             if self.eval_every > 0 and eval_batches_list:
@@ -1092,9 +1120,12 @@ class ZOTrainerBase:
         """
         sft_stage_dir = os.path.dirname(os.path.normpath(ref_path))
         fp32_suffix   = "_fp32" if self.compute_logps_fp32 else ""
+        
+        
+        ex_suffix = f"_ex{n_examples}" if n_examples is not None else ""
         eval_cache_file = os.path.join(
             sft_stage_dir,
-            f"ref_eval_logps_bs{self.config.batch_size}_bfloat16{fp32_suffix}.pt"
+            f"ref_eval_logps_bs{self.config.batch_size}{ex_suffix}_bfloat16{fp32_suffix}.pt"
         )
 
         if os.path.exists(eval_cache_file):
@@ -1208,6 +1239,7 @@ class ZOTrainerBase:
             "torch_rng": torch.get_rng_state(),
             "cuda_rng":  (torch.cuda.get_rng_state()
                           if torch.cuda.is_available() else None),
+            "python_rng": random.getstate(),
         }
 
         wandb_run_id: Optional[str] = None
@@ -1310,6 +1342,8 @@ class ZOTrainerBase:
             torch.set_rng_state(rng["torch_rng"].cpu())
         if rng.get("cuda_rng") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state(rng["cuda_rng"].cpu())
+        if rng.get("python_rng") is not None:
+            random.setstate(rng["python_rng"])
 
         self.resumed_wandb_run_id = payload.get("wandb_run_id", None)
         self.accelerator.wait_for_everyone()
@@ -1390,11 +1424,14 @@ class MeZOTrainer(ZOTrainerBase):
             z = torch.randn_like(p)
             grad_est = projected_grad * z
             
-            if name not in self.momentum_buffer:
-                self.momentum_buffer[name] = torch.zeros_like(p)
-                
-            self.momentum_buffer[name] = beta * self.momentum_buffer[name] + (1 - beta) * grad_est
-            p.data.add_(self.momentum_buffer[name], alpha= - self.lr)
+            if beta > 0.0:
+                if name not in self.momentum_buffer:
+                    self.momentum_buffer[name] = torch.zeros_like(p)
+                    
+                self.momentum_buffer[name] = beta * self.momentum_buffer[name] + (1 - beta) * grad_est
+                p.data.add_(self.momentum_buffer[name], alpha= - self.lr)
+            else:
+                p.data.add_(grad_est, alpha= - self.lr)
 
 
 # ============================================================

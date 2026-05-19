@@ -1,0 +1,159 @@
+import os
+import re
+import torch
+import transformers
+import hydra
+from omegaconf import OmegaConf, DictConfig
+from trl import DPOTrainer, DPOConfig
+from datasets import load_dataset
+from transformers import TrainerCallback
+
+def set_seed(seed: int):
+    transformers.set_seed(seed)
+
+def extract_dpo_messages(example):
+    def parse_to_messages(text):
+        parts = re.split(r'\n\n(Human|Assistant):', text)
+        msgs = []
+        for j in range(1, len(parts), 2):
+            role = "user" if parts[j].strip() == "Human" else "assistant"
+            content = parts[j+1].strip()
+            msgs.append({"role": role, "content": content})
+        return msgs
+
+    try:
+        chosen_full_msgs = parse_to_messages(example['chosen'])
+        rejected_full_msgs = parse_to_messages(example['rejected'])
+
+        # fined the last assistant response in both chosen and rejected
+        last_assistant_idx = -1
+        for idx in range(len(chosen_full_msgs) - 1, -1, -1):
+            if chosen_full_msgs[idx]["role"] == "assistant":
+                last_assistant_idx = idx
+                break
+        
+        last_rej_idx = -1
+        for idx in range(len(rejected_full_msgs) - 1, -1, -1):
+            if rejected_full_msgs[idx]["role"] == "assistant":
+                last_rej_idx = idx
+                break
+
+        if last_assistant_idx == -1 or last_rej_idx == -1:
+            return {"prompt": [], "chosen": [], "rejected": []}
+
+        prompt_msgs = chosen_full_msgs[:last_assistant_idx]
+        
+        chosen_msg = [chosen_full_msgs[last_assistant_idx]]
+        rejected_msg = [rejected_full_msgs[last_rej_idx]]
+
+        return {
+            "prompt": prompt_msgs,
+            "chosen": chosen_msg,
+            "rejected": rejected_msg
+        }
+    except Exception:
+        return {"prompt": [], "chosen": [], "rejected": []}
+
+import os
+os.environ["WANDB_PROJECT"] = "zo-dpo-memory-test"
+
+class MemoryResetCallback(TrainerCallback):
+    def on_train_begin(self, args, state, control, **kwargs):
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        print("\n>>> [Memory Sweep] Peak memory stats reset at train begin... <<<\n")
+
+@hydra.main(version_base=None, config_path="config", config_name="config")
+def main(config: DictConfig):
+    set_seed(config.seed)
+    
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank == 0:
+        print("=" * 72)
+        print("Trainer   : TRL DPOTrainer Baseline")
+        print(f"SFT Path  : {config.loss.sft_model_path}")
+        print("=" * 72)
+
+    cache_dir = os.path.expandvars(config.hf_cache_dir)
+    dtype = getattr(torch, config.model.policy_dtype)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        config.model.name_or_path, cache_dir=cache_dir, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        config.model.name_or_path, cache_dir=cache_dir, dtype=dtype,
+    )
+    ref_model = transformers.AutoModelForCausalLM.from_pretrained(
+        config.loss.sft_model_path, cache_dir=cache_dir, dtype=dtype,
+    )
+    model.gradient_checkpointing_enable()
+
+    ds_cache = os.path.expandvars(config.get("hf_dataset_cache_dir", ""))
+    
+    raw_train = load_dataset('Anthropic/hh-rlhf', split='train', cache_dir=ds_cache)
+    raw_eval = load_dataset('Anthropic/hh-rlhf', split='test', cache_dir=ds_cache)
+    
+    train_dataset = raw_train.map(
+        extract_dpo_messages, 
+        num_proc=8, 
+        remove_columns=raw_train.column_names
+    ).filter(lambda x: len(x["prompt"]) > 0)
+    
+    eval_dataset = raw_eval.map(
+        extract_dpo_messages, 
+        num_proc=8, 
+        remove_columns=raw_eval.column_names
+    ).filter(lambda x: len(x["prompt"]) > 0)
+
+    # DPO config
+    training_args = DPOConfig(
+        output_dir=os.path.join(os.environ.get("RUNS_DIR", "./runs"), config.exp_name),
+        beta=config.loss.beta,
+        learning_rate=config.trainer.lr,
+        lr_scheduler_type=config.trainer.get("lr_scheduler_type", "linear"),
+        warmup_ratio=config.trainer.get("warmup_ratio", 0.1),
+        per_device_train_batch_size=config.batch_size,
+        per_device_eval_batch_size=config.batch_size,
+        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
+        num_train_epochs=config.loss.get("num_epochs", 1),
+        max_steps=config.get("max_steps", -1),
+        max_length=config.max_length,
+        max_prompt_length=config.max_prompt_length,
+        logging_steps=10,
+        eval_steps=100,
+        eval_strategy="steps",
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=0,
+        bf16=(config.model.policy_dtype == "bfloat16"),
+        report_to="wandb" if config.wandb.enabled else "none",
+        run_name=f"baseline_trl_{config.exp_name}",
+        remove_unused_columns=False,
+        gradient_checkpointing=True,
+        # optim="adamw_8bit", # for server test with limited GPU memory
+    )
+
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        callbacks=[MemoryResetCallback()]
+    )
+
+    trainer.train()
+
+    if torch.cuda.is_available():
+        peak_mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(f"\n" + "="*45)
+        print(f"=== EXACT PEAK MEMORY (TRL Baseline): {peak_mem_gb:.2f} GB ===")
+        print("="*45 + "\n")
+
+if __name__ == "__main__":
+    main()

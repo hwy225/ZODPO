@@ -1,3 +1,5 @@
 name: fo_baseline
 
 lr: 1e-6
+warmup_ratio: 0.1
+lr_scheduler_type: cosine
